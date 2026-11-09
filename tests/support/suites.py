@@ -12,6 +12,12 @@ SuiteRunner = Callable[..., dict[str, Any]]
 SUITE_REGISTRY: dict[str, SuiteRunner] = {}
 
 
+def _api_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[str, Any]:
+    from .api_suite import run_api_suite
+
+    return run_api_suite(mode=mode, worktree=worktree, argv=argv)
+
+
 def register_suite(name: str, runner: SuiteRunner) -> None:
     if not name or not str(name).strip():
         raise StandError("Suite name must be non-empty")
@@ -56,3 +62,4 @@ def _stand_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[str, Any
 
 
 register_suite("stand", _stand_suite)
+register_suite("api", _api_suite)
