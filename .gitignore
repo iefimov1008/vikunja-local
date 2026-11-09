@@ -1,0 +1,32 @@
+# Runtime / stand artifacts — never commit local runs or secrets.
+.runtime/
+runtime/
+secrets/
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
+# Local journals and disposable stand outputs if ever mirrored into the worktree.
+ea010-r2/
+**/resource-manifest.json
+**/secrets.json
+**/stand.db
+**/stand.db-*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.swp
+*~

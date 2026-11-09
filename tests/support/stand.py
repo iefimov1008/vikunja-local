@@ -1,0 +1,2166 @@
+"""Real isolated Vikunja stand: profile, manifest, lifecycle, cleanup."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+DEFAULT_PROFILE_PATH = Path("/Users/efimovivan/.ai-platform/work/ea010-stand/profile-v1.json")
+PROFILE_ENV = "EA010_ISOLATED_STAND_PROFILE"
+SCHEMA = "ea010-isolated-stand-profile/v1"
+MANIFEST_SCHEMA = "ea010-stand-resource-manifest/v1"
+JOURNAL_SCHEMA = "ea010-stand-run-journal/v1"
+OWNERSHIP_SCHEMA = "ea010-stand-ownership-claim/v1"
+LIVE_LOCK_NAME = ".ea010-live.lock"
+OWNERSHIP_DIR_NAME = ".ea010-ownership"
+LAUNCH_RECEIPT_NAME = "launch-receipt.json"
+RUN_ID_RE = re.compile(r"^[0-9a-f]{16,64}$")
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+SAFE_DIR_MODE = 0o700
+SAFE_FILE_MODE = 0o600
+
+
+def ownership_dir(profile: "StandProfile") -> Path:
+    return profile.run_root / OWNERSHIP_DIR_NAME
+
+
+def ownership_claim_path(profile: "StandProfile", run_id: str) -> Path:
+    return ownership_dir(profile) / f"{validate_run_id(run_id)}.json"
+
+
+def _ensure_ownership_dir(profile: "StandProfile") -> Path:
+    path = ownership_dir(profile)
+    path.mkdir(mode=SAFE_DIR_MODE, exist_ok=True)
+    os.chmod(path, SAFE_DIR_MODE)
+    return path
+
+
+def write_ownership_claim(profile: "StandProfile", claim: dict[str, Any]) -> Path:
+    """Persist a durable ownership/cleanup claim outside the run tree being deleted."""
+    run_id = validate_run_id(str(claim.get("run_id") or ""))
+    bound = assert_immediate_run_child(profile.run_root, run_id, Path(claim["run_dir"]))
+    payload = {
+        "schema": OWNERSHIP_SCHEMA,
+        **claim,
+        "run_id": run_id,
+        "run_dir": str(bound),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _ensure_ownership_dir(profile)
+    path = ownership_claim_path(profile, run_id)
+    atomic_write_secure(
+        path,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        profile.sensitive_file_mode,
+    )
+    return path
+
+
+def load_ownership_claim(profile: "StandProfile", run_id: str) -> dict[str, Any] | None:
+    path = ownership_claim_path(profile, run_id)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StandError(f"Ownership claim unreadable: {path}: {exc}") from exc
+    if data.get("schema") != OWNERSHIP_SCHEMA:
+        raise StandError(f"Unexpected ownership claim schema at {path}")
+    return data
+
+
+def clear_ownership_claim(profile: "StandProfile", run_id: str) -> None:
+    path = ownership_claim_path(profile, run_id)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise StandError(f"Failed to clear ownership claim {path}: {exc}") from exc
+
+
+def ownership_claim_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": OWNERSHIP_SCHEMA,
+        "run_id": manifest.get("run_id"),
+        "run_dir": manifest.get("run_dir"),
+        "status": manifest.get("status"),
+        "process": manifest.get("process"),
+        "launch_receipt": manifest.get("launch_receipt"),
+        "ports": manifest.get("ports"),
+        "listen_host": manifest.get("listen_host"),
+        "cleanup_failure": manifest.get("cleanup_failure"),
+        "source": manifest.get("source"),
+        "binary": manifest.get("binary"),
+        "created_at": manifest.get("created_at"),
+    }
+
+
+class StandError(RuntimeError):
+    """Fail-closed stand or cleanup error."""
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        return None
+
+
+_OPENER = build_opener(ProxyHandler({}), _NoRedirect())
+
+
+def _mode_int(value: str | int) -> int:
+    if isinstance(value, int):
+        return value
+    return int(str(value), 8)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def write_secure(path: Path, data: bytes | str, mode: int = 0o600) -> None:
+    payload = data if isinstance(data, bytes) else data.encode()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_EXCL
+    fd = os.open(path, flags, mode)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    os.chmod(path, mode)
+
+
+def atomic_write_secure(path: Path, data: bytes | str, mode: int = 0o600) -> None:
+    payload = data if isinstance(data, bytes) else data.encode()
+    tmp = path.with_name(path.name + f".tmp-{os.getpid()}-{secrets.token_hex(4)}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        # Re-open to fsync the directory entry durability best-effort.
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        os.chmod(path, mode)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def validate_run_id(run_id: str) -> str:
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+        raise StandError(f"Unsafe or absolute run_id rejected: {run_id!r}")
+    if run_id in {".", ".."} or "/" in run_id or "\\" in run_id:
+        raise StandError(f"Unsafe run_id rejected: {run_id!r}")
+    return run_id
+
+
+def is_path_inside(parent: Path, child: Path) -> bool:
+    """True only when child is strictly inside parent (not equal)."""
+    parent_r = parent.resolve()
+    child_r = child.resolve()
+    try:
+        child_r.relative_to(parent_r)
+    except ValueError:
+        return False
+    return child_r != parent_r
+
+
+def assert_immediate_run_child(run_root: Path, run_id: str, run_dir: Path) -> Path:
+    """Require run_dir == resolved(run_root / run_id); reject root/siblings/escapes."""
+    validate_run_id(run_id)
+    root = run_root.resolve()
+    expected = (root / run_id).resolve()
+    if expected.parent != root:
+        raise StandError("run_dir escaped approved run_root parentage")
+    claimed = Path(run_dir)
+    if not claimed.is_absolute():
+        raise StandError(f"run_dir must be absolute, got {run_dir}")
+    claimed_resolved = claimed.resolve()
+    if claimed_resolved == root:
+        raise StandError("run_dir must not be the approved run_root itself")
+    # Reject startswith false friends (approved vs approved-sibling) even before
+    # comparing resolved paths, and reject any non-immediate child.
+    try:
+        relative = claimed_resolved.relative_to(root)
+    except ValueError as exc:
+        raise StandError(
+            f"run_dir must be the immediate run_id child of approved root; "
+            f"expected {expected}, got {claimed_resolved}"
+        ) from exc
+    if len(relative.parts) != 1 or relative.parts[0] != run_id:
+        raise StandError(
+            f"run_dir must be the immediate run_id child of approved root; "
+            f"expected {expected}, got {claimed_resolved}"
+        )
+    if claimed_resolved != expected:
+        raise StandError(
+            f"run_dir must be the immediate run_id child of approved root; "
+            f"expected {expected}, got {claimed_resolved}"
+        )
+    if claimed.name != run_id:
+        raise StandError(f"run_dir basename must equal run_id {run_id}, got {claimed.name}")
+    return expected
+
+
+def bind_manifest_paths(
+    profile: StandProfile,
+    manifest: dict[str, Any],
+    *,
+    manifest_path: Path | None = None,
+) -> Path:
+    run_id = validate_run_id(str(manifest.get("run_id") or ""))
+    if "run_dir" not in manifest:
+        raise StandError("Manifest missing run_dir")
+    run_dir = assert_immediate_run_child(profile.run_root, run_id, Path(manifest["run_dir"]))
+    if manifest_path is not None:
+        expected_manifest = run_dir / "resource-manifest.json"
+        if manifest_path.resolve() != expected_manifest.resolve():
+            raise StandError(
+                f"Manifest path is not bound to run_id child: {manifest_path} != {expected_manifest}"
+            )
+    return run_dir
+
+
+def _assert_not_git_worktree(path: Path) -> None:
+    """Reject run roots inside any Git worktree. No mutations."""
+    probe_paths = []
+    current = path
+    # Include path and existing parents so a not-yet-created leaf is still checked.
+    for _ in range(64):
+        probe_paths.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for probe in probe_paths:
+        if not probe.exists():
+            continue
+        result = subprocess.run(
+            ["git", "-C", str(probe), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip() == "true":
+            raise StandError(f"run_root must not be inside a Git worktree: {path}")
+
+
+def _validate_ports(ports: dict[str, Any]) -> dict[str, int]:
+    required = ("vikunja", "fault_proxy", "synthetic_hermes")
+    if any(name not in ports for name in required):
+        raise StandError("Stand profile ports incomplete")
+    parsed: dict[str, int] = {}
+    for name in required:
+        try:
+            value = int(ports[name])
+        except (TypeError, ValueError) as exc:
+            raise StandError(f"Stand profile port {name} is not an integer") from exc
+        if value <= 0 or value > 65535:
+            raise StandError(f"Stand profile port {name} out of range: {value}")
+        parsed[name] = value
+    if len(set(parsed.values())) != len(parsed):
+        raise StandError("Stand profile ports must be distinct")
+    return parsed
+
+
+def _validate_limits(limits: dict[str, Any]) -> dict[str, int]:
+    required = ("wall_seconds", "disk_bytes", "owned_process_tree_rss_bytes")
+    parsed: dict[str, int] = {}
+    for key in required:
+        if key not in limits:
+            raise StandError(f"Stand profile limit missing: {key}")
+        try:
+            value = int(limits[key])
+        except (TypeError, ValueError) as exc:
+            raise StandError(f"Stand profile limit {key} is not an integer") from exc
+        if value <= 0:
+            raise StandError(f"Stand profile limit {key} must be positive: {value}")
+        parsed[key] = value
+    return parsed
+
+
+def _validate_mode(value: Any, *, expected: int, label: str) -> int:
+    mode = _mode_int(value)
+    if mode != expected:
+        raise StandError(f"{label} must be {oct(expected)}, got {oct(mode)}")
+    if mode & 0o077:
+        raise StandError(f"{label} must not grant group/other bits: {oct(mode)}")
+    return mode
+
+
+@dataclass
+class StandProfile:
+    raw: dict[str, Any]
+    path: Path
+    binary_path: Path
+    binary_version: str
+    binary_sha256: str
+    run_root: Path
+    listen_host: str
+    ports: dict[str, int]
+    limits: dict[str, int]
+    fixture_prefix: str
+    run_directory_mode: int
+    sensitive_file_mode: int
+
+    @property
+    def vikunja_port(self) -> int:
+        return int(self.ports["vikunja"])
+
+    @property
+    def all_ports(self) -> tuple[int, ...]:
+        return tuple(int(self.ports[name]) for name in ("vikunja", "fault_proxy", "synthetic_hermes"))
+
+
+def resolve_profile_path(explicit: str | Path | None = None) -> Path:
+    if explicit is not None:
+        return Path(explicit).expanduser()
+    env = os.environ.get(PROFILE_ENV)
+    if env:
+        return Path(env).expanduser()
+    return DEFAULT_PROFILE_PATH
+
+
+def load_profile(explicit: str | Path | None = None) -> StandProfile:
+    """Load and validate profile. Performs no cleanup/chmod/create side effects."""
+    path = resolve_profile_path(explicit)
+    if not path.is_file():
+        raise StandError(f"Stand profile missing or unreadable: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StandError(f"Stand profile unreadable: {path}: {exc}") from exc
+    if raw.get("schema") != SCHEMA:
+        raise StandError(f"Unexpected stand profile schema: {raw.get('schema')!r}")
+    if raw.get("mode") != "isolated":
+        raise StandError(f"Stand profile mode must be isolated, got {raw.get('mode')!r}")
+    binary = raw.get("binary") or {}
+    for key in ("path", "version", "sha256"):
+        if key not in binary:
+            raise StandError(f"Stand profile binary.{key} missing")
+    binary_version = str(binary["version"])
+    if not binary_version.startswith("v") or "2.8.0" not in binary_version:
+        raise StandError(f"Stand profile binary.version not admitted: {binary_version!r}")
+    binary_sha256 = str(binary["sha256"]).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", binary_sha256):
+        raise StandError("Stand profile binary.sha256 must be 64 lowercase hex chars")
+    if "run_root" not in raw:
+        raise StandError("Stand profile run_root missing")
+    run_root = Path(raw["run_root"]).expanduser()
+    binary_path = Path(binary["path"]).expanduser()
+    if not run_root.is_absolute() or run_root.resolve() != run_root:
+        raise StandError("run_root must be a resolved absolute path without symlinks")
+    if not binary_path.is_absolute() or binary_path.resolve() != binary_path:
+        raise StandError("binary.path must be a resolved absolute path without symlinks")
+    _assert_not_git_worktree(run_root)
+    listen_host = str(raw.get("listen_host") or "")
+    if listen_host not in LOOPBACK_HOSTS:
+        raise StandError(f"listen_host must be loopback, got {listen_host!r}")
+    ports = _validate_ports(raw.get("ports") or {})
+    limits = _validate_limits(raw.get("limits") or {})
+    run_directory_mode = _validate_mode(
+        raw.get("run_directory_mode", "0700"),
+        expected=SAFE_DIR_MODE,
+        label="run_directory_mode",
+    )
+    sensitive_file_mode = _validate_mode(
+        raw.get("sensitive_file_mode", "0600"),
+        expected=SAFE_FILE_MODE,
+        label="sensitive_file_mode",
+    )
+    fixture_prefix = str(raw.get("fixture_prefix") or "EA010-SYNTHETIC-")
+    if not fixture_prefix.startswith("EA010-SYNTHETIC-"):
+        raise StandError(f"fixture_prefix must start with EA010-SYNTHETIC-, got {fixture_prefix!r}")
+    return StandProfile(
+        raw=raw,
+        path=path.resolve(),
+        binary_path=binary_path,
+        binary_version=binary_version,
+        binary_sha256=binary_sha256,
+        run_root=run_root,
+        listen_host=listen_host,
+        ports=ports,
+        limits=limits,
+        fixture_prefix=fixture_prefix,
+        run_directory_mode=run_directory_mode,
+        sensitive_file_mode=sensitive_file_mode,
+    )
+
+
+def verify_binary(profile: StandProfile) -> dict[str, str]:
+    path = profile.binary_path
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise StandError(f"Pinned Vikunja binary missing or not executable: {path}")
+    digest = sha256_file(path)
+    if digest != profile.binary_sha256:
+        raise StandError(
+            f"Pinned binary SHA256 mismatch: expected {profile.binary_sha256}, got {digest}"
+        )
+    result = subprocess.run(
+        [str(path), "version"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise StandError(f"Unable to read binary version: rc={result.returncode}")
+    version_line = (result.stdout or result.stderr or "").strip().splitlines()[0]
+    if profile.binary_version not in version_line:
+        raise StandError(
+            f"Binary version mismatch: expected {profile.binary_version!r}, got {version_line!r}"
+        )
+    return {"path": str(path), "sha256": digest, "version_line": version_line}
+
+
+def listeners(port: int) -> set[int]:
+    result = subprocess.run(
+        ["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode not in (0, 1) or result.stderr.strip():
+        raise StandError(f"Cannot verify listeners on port {port}")
+    return {int(line[1:]) for line in result.stdout.splitlines() if line.startswith("p")}
+
+
+def assert_ports_free(ports: tuple[int, ...], host: str = "127.0.0.1") -> None:
+    for port in ports:
+        owned = listeners(port)
+        if owned:
+            raise StandError(f"Port {port} already has listener PIDs {sorted(owned)}")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((host, port))
+            except OSError as exc:
+                raise StandError(f"Port {port} is busy and cannot be bound: {exc}") from exc
+
+
+def process_start_identity(pid: int) -> dict[str, str]:
+    result = subprocess.run(
+        ["/bin/ps", "-p", str(pid), "-o", "pid=,lstart=,args="],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise StandError(f"Cannot read process identity for PID {pid}")
+    line = result.stdout.strip()
+    parts = line.split(None, 6)
+    if len(parts) < 7:
+        raise StandError(f"Unexpected ps identity format for PID {pid}: {line!r}")
+    lstart = " ".join(parts[1:6])
+    args = parts[6]
+    return {"pid": str(pid), "lstart": lstart, "args": args}
+
+
+def process_matches_identity(identity: dict[str, str]) -> bool:
+    """Match owned process by PID + start time.
+
+    Args are recorded for evidence but are not required for the match: the
+    stand launches through a short Python exec wrapper, so argv changes once
+    while the PID/start identity stays stable.
+    """
+    try:
+        current = process_start_identity(int(identity["pid"]))
+    except StandError:
+        return False
+    return current["pid"] == str(identity["pid"]) and current["lstart"] == identity.get("lstart")
+
+
+def process_rss_bytes(pid: int) -> int:
+    result = subprocess.run(
+        ["/bin/ps", "-o", "rss=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise StandError(f"Cannot read RSS for PID {pid}")
+    return int(result.stdout.strip()) * 1024
+
+
+def process_tree_pids(root_pid: int) -> list[int]:
+    seen: set[int] = set()
+    ordered: list[int] = []
+    queue = [root_pid]
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        ordered.append(pid)
+        result = subprocess.run(
+            ["/usr/bin/pgrep", "-P", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode not in (0, 1):
+            continue
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                queue.append(int(line))
+    return ordered
+
+
+def process_tree_rss_bytes(root_pid: int) -> int:
+    total = 0
+    for pid in process_tree_pids(root_pid):
+        try:
+            total += process_rss_bytes(pid)
+        except StandError:
+            continue
+    return total
+
+
+def directory_disk_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file() and not item.is_symlink():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def http_json(
+    host: str,
+    port: int,
+    path: str,
+    method: str = "GET",
+    body: Any | None = None,
+    token: str | None = None,
+    timeout: float = 5.0,
+) -> tuple[int, Any]:
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    payload = None
+    if body is not None:
+        payload = body if isinstance(body, bytes) else json.dumps(body).encode()
+    request = Request(
+        f"http://{host}:{port}/api/v1/{path.lstrip('/')}",
+        data=payload,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with _OPENER.open(request, timeout=timeout) as response:
+            raw = response.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024:
+                raise StandError("Unexpectedly large API response")
+            if not raw:
+                return response.status, None
+            return response.status, json.loads(raw.decode())
+    except HTTPError as exc:
+        try:
+            raw = exc.read(1024 * 1024) if hasattr(exc, "read") else b""
+        finally:
+            try:
+                exc.close()
+            except Exception:
+                pass
+        data = None
+        if raw:
+            try:
+                data = json.loads(raw.decode())
+            except json.JSONDecodeError:
+                data = raw.decode(errors="replace")
+        return exc.code, data
+
+
+class LiveRunLock:
+    """Exclusive flock for one live stand under an approved run_root."""
+
+    def __init__(self, run_root: Path):
+        self.run_root = run_root
+        self.path = run_root / LIVE_LOCK_NAME
+        self._fd: int | None = None
+
+    @property
+    def held(self) -> bool:
+        return self._fd is not None
+
+    def acquire(self) -> None:
+        self.run_root.mkdir(mode=SAFE_DIR_MODE, exist_ok=True)
+        os.chmod(self.run_root, SAFE_DIR_MODE)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, SAFE_FILE_MODE)
+        try:
+            os.chmod(self.path, SAFE_FILE_MODE)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(fd)
+            raise StandError(
+                f"Refusing concurrent live stand under {self.run_root}: lock busy"
+            ) from exc
+        except Exception:
+            os.close(fd)
+            raise
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.fsync(fd)
+        self._fd = fd
+
+    def release(self) -> None:
+        fd = self._fd
+        self._fd = None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def __enter__(self) -> "LiveRunLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.release()
+
+
+@dataclass
+class TokenHandle:
+    handle: str
+    token_id: int | None = None
+    kind: str = "api_token"
+
+
+class LimitWatchdog:
+    """Periodic ownership-limit enforcement across idle/callback time."""
+
+    def __init__(self, stand: "IsolatedStand", interval: float = 0.25):
+        self.stand = stand
+        self.interval = interval
+        self._stop = threading.Event()
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, name="ea010-limit-watchdog", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise StandError(f"Resource limit breached: {self._error}") from self._error
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                self.stand._enforce_limits()
+            except StandError as exc:
+                self._error = exc
+                try:
+                    self.stand.stop_process(sig=signal.SIGKILL, wait_timeout=3.0)
+                except Exception:
+                    pass
+                return
+
+
+@dataclass
+class IsolatedStand:
+    profile: StandProfile
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    worktree: Path | None = None
+    journal_path: Path | None = None
+    # Test-only hooks (never set in production runners).
+    _test_crash_after_popen: Callable[["IsolatedStand", subprocess.Popen[Any]], None] | None = field(
+        default=None, repr=False
+    )
+    _test_popen: Callable[..., subprocess.Popen[Any]] | None = field(default=None, repr=False)
+    _test_time_anchor: float | None = field(default=None, repr=False)
+    _child: subprocess.Popen[Any] | None = field(default=None, init=False, repr=False)
+    _started_at: float | None = field(default=None, init=False, repr=False)
+    _session_token: str | None = field(default=None, init=False, repr=False)
+    _password: str | None = field(default=None, init=False, repr=False)
+    _username: str = field(default="ea010_stand", init=False, repr=False)
+    _token_secrets: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _signal_handlers: dict[int, Any] = field(default_factory=dict, init=False, repr=False)
+    _live_lock: LiveRunLock | None = field(default=None, init=False, repr=False)
+    _watchdog: LimitWatchdog | None = field(default=None, init=False, repr=False)
+    _handshake_read_fd: int | None = field(default=None, init=False, repr=False)
+    _handshake_write_fd: int | None = field(default=None, init=False, repr=False)
+    _created_run_dir: bool = field(default=False, init=False, repr=False)
+    manifest: dict[str, Any] = field(default_factory=dict, init=False)
+    cleaned: bool = field(default=False, init=False)
+    readiness: dict[str, Any] | None = field(default=None, init=False)
+    synthetic_ids: dict[str, Any] = field(default_factory=dict, init=False)
+    file_modes: dict[str, str] = field(default_factory=dict, init=False)
+    secondary_cleanup_error: BaseException | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        validate_run_id(self.run_id)
+
+    @property
+    def run_dir(self) -> Path:
+        return assert_immediate_run_child(self.profile.run_root, self.run_id, self.profile.run_root / self.run_id)
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.run_dir / "resource-manifest.json"
+
+    @property
+    def secrets_path(self) -> Path:
+        return self.run_dir / "secrets.json"
+
+    @property
+    def launch_receipt_path(self) -> Path:
+        return self.run_dir / LAUNCH_RECEIPT_NAME
+
+    @property
+    def durable_claim_path(self) -> Path:
+        return ownership_claim_path(self.profile, self.run_id)
+
+    def fixture_name(self, suffix: str) -> str:
+        return f"{self.profile.fixture_prefix}{self.run_id}-{suffix}"
+
+    def _now_monotonic(self) -> float:
+        if self._test_time_anchor is not None:
+            return self._test_time_anchor
+        return time.monotonic()
+
+    def _enforce_limits(self) -> None:
+        if self._started_at is not None:
+            elapsed = self._now_monotonic() - self._started_at
+            if elapsed > self.profile.limits["wall_seconds"]:
+                raise StandError(f"Wall-clock limit exceeded: {elapsed:.1f}s")
+        if self.run_dir.exists():
+            disk = directory_disk_bytes(self.run_dir)
+            if disk > self.profile.limits["disk_bytes"]:
+                raise StandError(f"Disk limit exceeded: {disk} bytes")
+        if self._child is not None and self._child.poll() is None:
+            rss = process_tree_rss_bytes(self._child.pid)
+            if rss > self.profile.limits["owned_process_tree_rss_bytes"]:
+                raise StandError(f"RSS limit exceeded: {rss} bytes")
+
+    def _save_ownership_claim(self, extra: dict[str, Any] | None = None) -> None:
+        """Mirror recoverable ownership outside the run tree (survives partial rmtree)."""
+        if not self.manifest:
+            claim = {
+                "schema": OWNERSHIP_SCHEMA,
+                "run_id": self.run_id,
+                "run_dir": str(self.run_dir),
+                "status": "prepared",
+                "process": None,
+            }
+        else:
+            claim = ownership_claim_from_manifest(self.manifest)
+            claim["run_id"] = self.run_id
+            claim["run_dir"] = str(self.run_dir)
+        if extra:
+            claim.update(extra)
+        write_ownership_claim(self.profile, claim)
+
+    def _clear_ownership_claim(self) -> None:
+        clear_ownership_claim(self.profile, self.run_id)
+
+    def _save_manifest(self) -> None:
+        self.manifest["schema"] = MANIFEST_SCHEMA
+        self.manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+        # Durable outside-tree claim first so partial recursive delete cannot erase
+        # the only recovery record.
+        self._save_ownership_claim()
+        if self.run_dir.exists():
+            atomic_write_secure(
+                self.manifest_path,
+                json.dumps(self.manifest, indent=2, sort_keys=True) + "\n",
+                self.profile.sensitive_file_mode,
+            )
+
+    def _save_secrets(self) -> None:
+        payload = {
+            "session_token_handle": "session",
+            "tokens": {
+                handle: {"secret_present": True}
+                for handle in self._token_secrets
+            },
+            # Secrets stay outside Git; file mode 0600 under approved run-root.
+            "values": dict(self._token_secrets),
+            "password": self._password,
+            "username": self._username,
+        }
+        atomic_write_secure(
+            self.secrets_path,
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            self.profile.sensitive_file_mode,
+        )
+
+    def _save_launch_receipt(self, payload: dict[str, Any]) -> None:
+        atomic_write_secure(
+            self.launch_receipt_path,
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            self.profile.sensitive_file_mode,
+        )
+
+    def _release_live_lock(self) -> None:
+        lock = self._live_lock
+        self._live_lock = None
+        if lock is not None:
+            lock.release()
+
+    def _stop_watchdog(self) -> None:
+        watchdog = self._watchdog
+        self._watchdog = None
+        if watchdog is not None:
+            watchdog.stop()
+
+    def _close_handshake_fd(self, attr: str) -> None:
+        fd = getattr(self, attr)
+        setattr(self, attr, None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _close_handshake(self) -> None:
+        # Close any still-owned pipe ends; safe if already transferred/cleared.
+        self._close_handshake_fd("_handshake_read_fd")
+        self._close_handshake_fd("_handshake_write_fd")
+
+    def prepare(self) -> dict[str, Any]:
+        """Validate inputs, take exclusive live lock, then recover orphans and stage files."""
+        validate_run_id(self.run_id)
+        # Exclusive live-run lock before any destructive recovery.
+        if self._live_lock is None:
+            lock = LiveRunLock(self.profile.run_root)
+            lock.acquire()
+            self._live_lock = lock
+        try:
+            # Binary pin first; owned-orphan recovery under the lock must run before
+            # rejecting remaining foreign listeners so SIGKILL orphans can be reclaimed.
+            verify_binary(self.profile)
+            cleanup_orphaned_runs(
+                self.profile,
+                require_exclusive_owner=True,
+                owned_live_lock=self._live_lock,
+            )
+            # Foreign listeners that remain after owned recovery still refuse admission.
+            assert_ports_free(self.profile.all_ports, self.profile.listen_host)
+            os.chmod(self.profile.run_root, self.profile.run_directory_mode)
+            if self.run_dir.exists():
+                raise StandError(f"Run directory already exists: {self.run_dir}")
+            self.run_dir.mkdir(mode=self.profile.run_directory_mode)
+            # Only a directory created by this invocation may be rolled back on failure.
+            self._created_run_dir = True
+            os.chmod(self.run_dir, self.profile.run_directory_mode)
+            (self.run_dir / "files").mkdir(mode=self.profile.run_directory_mode)
+            config = {
+                "service": {
+                    "interface": f"{self.profile.listen_host}:{self.profile.vikunja_port}",
+                    "publicurl": f"http://{self.profile.listen_host}:{self.profile.vikunja_port}/",
+                    "rootpath": str(self.run_dir),
+                    "secret": secrets.token_hex(32),
+                    "enableregistration": True,
+                },
+                "database": {"type": "sqlite", "path": str(self.run_dir / "stand.db")},
+                "files": {"basepath": str(self.run_dir / "files"), "maxsize": "1MB"},
+                "mailer": {"enabled": False},
+                "log": {"enabled": False},
+                "cors": {"origins": [f"http://{self.profile.listen_host}:{self.profile.vikunja_port}"]},
+            }
+            config_path = self.run_dir / "config.json"
+            write_secure(
+                config_path,
+                json.dumps(config, indent=2, sort_keys=True) + "\n",
+                self.profile.sensitive_file_mode,
+            )
+            source = self._source_digest()
+            self.manifest = {
+                "schema": MANIFEST_SCHEMA,
+                "run_id": self.run_id,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "profile_path": str(self.profile.path),
+                "profile_sha256": sha256_file(self.profile.path),
+                "binary": verify_binary(self.profile),
+                "run_dir": str(self.run_dir),
+                "ports": dict(self.profile.ports),
+                "listen_host": self.profile.listen_host,
+                "fixture_prefix": self.profile.fixture_prefix,
+                "process": None,
+                "token_handles": [],
+                "synthetic_ids": {},
+                "source": source,
+                "status": "prepared",
+            }
+            bind_manifest_paths(self.profile, self.manifest, manifest_path=self.manifest_path)
+            self._save_manifest()
+            return self.manifest
+        except BaseException:
+            # Roll back only a directory this invocation proved it created.
+            rollback_ok = True
+            if (
+                self._created_run_dir
+                and self.run_dir.exists()
+                and not (self.manifest.get("process") or {}).get("pid")
+            ):
+                # Durable claim before delete so a partial rmtree remains reclaimable.
+                try:
+                    self._save_ownership_claim({"status": self.manifest.get("status") or "prepared"})
+                except Exception:
+                    pass
+                try:
+                    shutil.rmtree(self.run_dir)
+                except OSError as exc:
+                    rollback_ok = False
+                    self._record_cleanup_failure(
+                        [f"prepare rollback rmtree failed: {exc}"],
+                        {"directory_retained": self.run_dir.exists()},
+                    )
+                if self.run_dir.exists():
+                    rollback_ok = False
+                    if self.manifest.get("status") != "cleanup_failed":
+                        self._record_cleanup_failure(
+                            ["prepare rollback left owned directory"],
+                            {"directory_retained": True},
+                        )
+                else:
+                    self._created_run_dir = False
+                    try:
+                        self._clear_ownership_claim()
+                    except StandError:
+                        rollback_ok = False
+            if rollback_ok:
+                self._release_live_lock()
+            raise
+
+    def _source_digest(self) -> dict[str, str]:
+        root = self.worktree or Path.cwd()
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        head = result.stdout.strip() if result.returncode == 0 else "unknown"
+        diff = subprocess.run(
+            ["git", "diff", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            check=False,
+        )
+        # Include untracked candidate files so early-stage digests are non-empty
+        # before the coordinator helper commits the stage.
+        untracked = subprocess.run(
+            ["git", "ls-files", "-o", "--exclude-standard"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        material = bytearray(diff.stdout or b"")
+        paths = []
+        for rel in (untracked.stdout or "").splitlines():
+            path = root / rel
+            if not path.is_file():
+                continue
+            # Keep docs/process and accepted inputs out of the implementation digest.
+            if rel.startswith("docs/"):
+                continue
+            paths.append(rel)
+            material.extend(rel.encode())
+            material.extend(b"\0")
+            material.extend(path.read_bytes())
+            material.extend(b"\0")
+        return {
+            "worktree": str(root),
+            "head": head,
+            "diff_sha256": sha256_bytes(bytes(material)),
+            "untracked_implementation_files": paths,
+        }
+
+    def start(self) -> None:
+        if not self.manifest:
+            self.prepare()
+        if self._live_lock is None:
+            raise StandError("Cannot start without exclusive live-run lock")
+        config_path = self.run_dir / "config.json"
+        read_fd, write_fd = os.pipe()
+        # Own both ends before spawn can fail so unwind/close never leaks an end.
+        self._handshake_read_fd = read_fd
+        self._handshake_write_fd = write_fd
+        # Crash-safe handshake: child blocks before exec until identity is durable.
+        wrapper = (
+            "import os,resource,select,sys\n"
+            "os.umask(0o077)\n"
+            f"limit={int(self.profile.limits['disk_bytes'])}\n"
+            "resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit))\n"
+            "ready,_,_ = select.select([sys.stdin],[],[],15)\n"
+            "if not ready:\n"
+            "    sys.exit(75)\n"
+            "if os.read(0,1) != b'G':\n"
+            "    sys.exit(76)\n"
+            "os.execv(sys.argv[1], sys.argv[1:])\n"
+        )
+        popen = self._test_popen or subprocess.Popen
+        try:
+            child = popen(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    wrapper,
+                    str(self.profile.binary_path),
+                    "--config",
+                    str(config_path),
+                    "web",
+                ],
+                cwd=str(self.run_dir),
+                env={
+                    "HOME": str(self.run_dir),
+                    "PATH": "/usr/bin:/bin",
+                    "GOMEMLIMIT": "1GiB",
+                },
+                stdin=read_fd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except BaseException:
+            # Spawn failed: nothing was transferred to a child; close both ends.
+            self._close_handshake()
+            raise
+        # Successful spawn: close only the parent's copy of the read end.
+        # Do not close write_fd here — it remains owned until handshake release.
+        self._close_handshake_fd("_handshake_read_fd")
+        self._child = child
+        self._started_at = self._now_monotonic()
+        try:
+            # Durable pre-identity receipt before any crash-window probe / release.
+            receipt = {
+                "schema": "ea010-stand-launch-receipt/v1",
+                "run_id": self.run_id,
+                "pid": child.pid,
+                "phase": "pre-identity",
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._save_launch_receipt(receipt)
+            self.manifest["launch_receipt"] = receipt
+            self.manifest["process"] = {"pid": child.pid, "identity": None}
+            self.manifest["status"] = "launching"
+            self._save_manifest()
+            if self._test_crash_after_popen is not None:
+                # Injected crash must happen before identity persistence + release.
+                self._test_crash_after_popen(self, child)
+            identity = process_start_identity(child.pid)
+            self.manifest["process"] = {
+                "pid": child.pid,
+                "identity": identity,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.manifest["status"] = "starting"
+            self._save_manifest()
+            receipt = {
+                "schema": "ea010-stand-launch-receipt/v1",
+                "run_id": self.run_id,
+                "pid": child.pid,
+                "phase": "identity-persisted",
+                "identity": identity,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._save_launch_receipt(receipt)
+            self.manifest["launch_receipt"] = receipt
+            self._save_manifest()
+            # Release the child only after recoverable identity is on disk.
+            os.write(write_fd, b"G")
+            self._close_handshake()
+        except BaseException:
+            self._close_handshake()
+            try:
+                if child.poll() is None:
+                    os.kill(child.pid, signal.SIGKILL)
+                    child.wait(timeout=5)
+            except Exception:
+                pass
+            raise
+        self._watchdog = LimitWatchdog(self)
+        self._watchdog.start()
+
+    def _refresh_process_identity(self) -> None:
+        if self._child is None or self._child.poll() is not None:
+            return
+        identity = process_start_identity(self._child.pid)
+        process = dict(self.manifest.get("process") or {})
+        process.update({"pid": self._child.pid, "identity": identity})
+        self.manifest["process"] = process
+        self._save_manifest()
+
+    def _assert_sensitive_file_modes(self) -> dict[str, str]:
+        expected = self.profile.sensitive_file_mode
+        observed: dict[str, str] = {}
+        candidates = [
+            self.run_dir / "config.json",
+            self.manifest_path,
+            self.run_dir / "stand.db",
+            self.run_dir / "stand.db-wal",
+            self.run_dir / "stand.db-shm",
+        ]
+        for path in candidates:
+            if not path.exists():
+                continue
+            mode = path.stat().st_mode & 0o777
+            observed[path.name] = oct(mode)
+            if mode != expected:
+                raise StandError(
+                    f"Sensitive file mode for {path.name} is {oct(mode)}, expected {oct(expected)}"
+                )
+        self.file_modes = observed
+        self.manifest["file_modes"] = observed
+        self._save_manifest()
+        return observed
+
+    def wait_ready(self, timeout: float = 20.0) -> dict[str, Any]:
+        if self._child is None:
+            raise StandError("Stand process has not been started")
+        deadline = time.monotonic() + timeout
+        last_error = "not ready"
+        while time.monotonic() < deadline:
+            if self._watchdog is not None:
+                self._watchdog.raise_if_failed()
+            self._enforce_limits()
+            if self._child.poll() is not None:
+                raise StandError(f"Isolated Vikunja exited during startup rc={self._child.returncode}")
+            try:
+                owned = listeners(self.profile.vikunja_port)
+                if owned != {self._child.pid}:
+                    time.sleep(0.1)
+                    continue
+                status, info = http_json(
+                    self.profile.listen_host,
+                    self.profile.vikunja_port,
+                    "info",
+                )
+                if status == 200 and isinstance(info, dict):
+                    # Capture post-exec identity once the binary owns the port.
+                    self._refresh_process_identity()
+                    self._assert_sensitive_file_modes()
+                    self.readiness = {"http": status, "info": info, "file_modes": dict(self.file_modes)}
+                    self.manifest["readiness"] = {
+                        "http": status,
+                        "version": info.get("version"),
+                    }
+                    self.manifest["status"] = "ready"
+                    self._save_manifest()
+                    return self.readiness
+                last_error = f"info HTTP {status}"
+            except (URLError, TimeoutError, StandError, json.JSONDecodeError) as exc:
+                last_error = str(exc)
+            time.sleep(0.1)
+        raise StandError(f"Isolated Vikunja did not become ready: {last_error}")
+
+    def api(
+        self,
+        path: str,
+        method: str = "GET",
+        body: Any | None = None,
+        token: str | None = None,
+    ) -> tuple[int, Any]:
+        if self._watchdog is not None:
+            self._watchdog.raise_if_failed()
+        if self._child is None or self._child.poll() is not None:
+            raise StandError("Stand process is not running")
+        owned = listeners(self.profile.vikunja_port)
+        if owned != {self._child.pid}:
+            raise StandError(f"Listener ownership changed on {self.profile.vikunja_port}: {owned}")
+        self._enforce_limits()
+        return http_json(
+            self.profile.listen_host,
+            self.profile.vikunja_port,
+            path,
+            method=method,
+            body=body,
+            token=token,
+        )
+
+    def create_synthetic_session(self) -> dict[str, Any]:
+        self._password = secrets.token_urlsafe(24)
+        self._username = f"ea010_{self.run_id[:8]}"
+        status, _ = self.api(
+            "register",
+            "POST",
+            {
+                "username": self._username,
+                "email": f"{self._username}@example.invalid",
+                "password": self._password,
+            },
+        )
+        if status != 200:
+            raise StandError(f"Synthetic registration failed: HTTP {status}")
+        status, login = self.api(
+            "login",
+            "POST",
+            {"username": self._username, "password": self._password},
+        )
+        if status != 200 or not isinstance(login, dict) or "token" not in login:
+            raise StandError(f"Synthetic login failed: HTTP {status}")
+        self._session_token = login["token"]
+        self._token_secrets["session"] = self._session_token
+        status, project = self.api(
+            "projects",
+            "PUT",
+            {"title": self.fixture_name("project")},
+            token=self._session_token,
+        )
+        if status != 201 or not isinstance(project, dict):
+            raise StandError(f"Synthetic project creation failed: HTTP {status}")
+        marker = self.fixture_name("task")
+        status, task = self.api(
+            f"projects/{project['id']}/tasks",
+            "PUT",
+            {"title": self.fixture_name("title"), "description": marker},
+            token=self._session_token,
+        )
+        if status != 201 or not isinstance(task, dict):
+            raise StandError(f"Synthetic task creation failed: HTTP {status}")
+        expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        status, api_token = self.api(
+            "tokens",
+            "PUT",
+            {
+                "title": self.fixture_name("token"),
+                "expires_at": expires,
+                "permissions": {"tasks": ["read_all"]},
+            },
+            token=self._session_token,
+        )
+        if status != 201 or not isinstance(api_token, dict):
+            raise StandError(f"Synthetic API token creation failed: HTTP {status}")
+        handle = "api_token_primary"
+        self._token_secrets[handle] = api_token["token"]
+        self.synthetic_ids = {
+            "project_id": project["id"],
+            "task_id": task["id"],
+            "marker": marker,
+            "api_token_id": api_token["id"],
+            "api_token_handle": handle,
+            "username": self._username,
+        }
+        self.manifest["token_handles"] = ["session", handle]
+        self.manifest["synthetic_ids"] = {
+            "project_id": project["id"],
+            "task_id": task["id"],
+            "marker": marker,
+            "api_token_id": api_token["id"],
+            "api_token_handle": handle,
+        }
+        self.manifest["status"] = "fixtures_ready"
+        self._save_manifest()
+        self._save_secrets()
+        return dict(self.synthetic_ids)
+
+    def revoke_token(self, handle: str = "api_token_primary") -> dict[str, Any]:
+        if not self._session_token:
+            raise StandError("Cannot revoke token without an active session")
+        token_id = self.synthetic_ids.get("api_token_id")
+        if handle != self.synthetic_ids.get("api_token_handle") or token_id is None:
+            raise StandError(f"Unknown token handle for revoke: {handle}")
+        # Prove session still works before revoke.
+        status, _ = self.api("tokens", token=self._session_token)
+        if status != 200:
+            raise StandError(f"Active session required for revoke; tokens list HTTP {status}")
+        status, _ = self.api(f"tokens/{token_id}", "DELETE", token=self._session_token)
+        if status != 200:
+            raise StandError(f"Token revoke failed: HTTP {status}")
+        # Read-back: revoked token must not authorize; session remains valid.
+        revoked_secret = self._token_secrets.get(handle)
+        if not revoked_secret:
+            raise StandError("Missing local token secret for revoke read-back")
+        revoked_status, _ = self.api("tasks", token=revoked_secret)
+        session_status, tokens = self.api("tokens", token=self._session_token)
+        if session_status != 200:
+            raise StandError(f"Session read-back after revoke failed: HTTP {session_status}")
+        remaining_ids = []
+        if isinstance(tokens, list):
+            remaining_ids = [row.get("id") for row in tokens]
+        elif isinstance(tokens, dict):
+            remaining_ids = [row.get("id") for row in tokens.get("tokens", tokens.get("data", []))]
+        evidence = {
+            "handle": handle,
+            "token_id": token_id,
+            "delete_http": status,
+            "revoked_token_http": revoked_status,
+            "session_list_http": session_status,
+            "token_absent_after_revoke": token_id not in remaining_ids,
+        }
+        if revoked_status not in (401, 403):
+            raise StandError(f"Revoked token still authorized: HTTP {revoked_status}")
+        if token_id in remaining_ids:
+            raise StandError("Revoked token id still present in session token list")
+        self.manifest.setdefault("revoke_readback", []).append(evidence)
+        self.manifest["token_handles"] = [
+            item for item in self.manifest.get("token_handles", []) if item != handle
+        ]
+        self._token_secrets.pop(handle, None)
+        self._save_manifest()
+        self._save_secrets()
+        return evidence
+
+    def stop_process(self, sig: int = signal.SIGTERM, wait_timeout: float = 8.0) -> None:
+        child = self._child
+        if child is None:
+            return
+        if child.poll() is None:
+            identity = (self.manifest.get("process") or {}).get("identity")
+            if identity and not process_matches_identity(identity):
+                raise StandError("Refusing to signal process: PID identity mismatch")
+            os.kill(child.pid, sig)
+            try:
+                child.wait(timeout=wait_timeout)
+            except subprocess.TimeoutExpired:
+                current = identity or process_start_identity(child.pid)
+                if process_matches_identity(current):
+                    os.kill(child.pid, signal.SIGKILL)
+                    child.wait(timeout=5)
+        self.manifest["process_exit"] = {
+            "rc": child.returncode,
+            "stopped_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if self.manifest_path.exists():
+            self._save_manifest()
+
+    def _record_cleanup_failure(self, errors: list[str], extra: dict[str, Any] | None = None) -> None:
+        payload = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "errors": list(errors),
+        }
+        if extra:
+            payload.update(extra)
+        if not self.manifest:
+            self.manifest = {
+                "schema": MANIFEST_SCHEMA,
+                "run_id": self.run_id,
+                "run_dir": str(self.run_dir),
+                "process": None,
+            }
+        self.manifest["cleanup_failure"] = payload
+        self.manifest["status"] = "cleanup_failed"
+        # Always persist outside the tree first; in-tree may already be gone.
+        try:
+            self._save_ownership_claim({"cleanup_failure": payload, "status": "cleanup_failed"})
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"failed to persist durable ownership claim: {exc}")
+        if self.run_dir.exists() and self.manifest_path.exists():
+            try:
+                atomic_write_secure(
+                    self.manifest_path,
+                    json.dumps(self.manifest, indent=2, sort_keys=True) + "\n",
+                    self.profile.sensitive_file_mode,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"failed to persist in-tree cleanup_failure: {exc}")
+        elif self.run_dir.exists():
+            # Manifest already removed by partial rmtree; recreate from durable claim.
+            try:
+                atomic_write_secure(
+                    self.manifest_path,
+                    json.dumps(self.manifest, indent=2, sort_keys=True) + "\n",
+                    self.profile.sensitive_file_mode,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"failed to recreate in-tree cleanup_failure: {exc}")
+
+    def cleanup(self, *, revoke: bool = True) -> dict[str, Any]:
+        errors: list[str] = []
+        revoke_evidence = None
+        stop_error = None
+        listeners_after: dict[str, list[int]] = {}
+        still_matches = False
+        self._stop_watchdog()
+        self._close_handshake()
+        # Revoke may raise transport/IO faults from http_json (URLError/TimeoutError/
+        # JSONDecodeError/OSError). Accumulate them, and always reach owned-process
+        # stop + port read-back in finally so a revoke fault cannot orphan the child
+        # after watchdog stop (implementation-plan §6 / NFR-18).
+        try:
+            if revoke and self._session_token and self.synthetic_ids.get("api_token_id") is not None:
+                if self.synthetic_ids.get("api_token_handle") in self._token_secrets:
+                    try:
+                        revoke_evidence = self.revoke_token(
+                            self.synthetic_ids["api_token_handle"]
+                        )
+                    except (StandError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+                        errors.append(f"token revoke failed: {exc}")
+        finally:
+            try:
+                self.stop_process()
+            except StandError as exc:
+                stop_error = str(exc)
+                errors.append(f"stop failed: {exc}")
+            process = self.manifest.get("process") or {}
+            identity = process.get("identity")
+            still_matches = bool(identity and process_matches_identity(identity))
+            try:
+                for port in self.profile.all_ports:
+                    listeners_after[str(port)] = sorted(listeners(port))
+            except StandError as exc:
+                errors.append(str(exc))
+        busy = {port: pids for port, pids in listeners_after.items() if pids}
+
+        # Retain manifest/recovery state until process ownership is cleared.
+        if errors or still_matches or busy:
+            self._record_cleanup_failure(
+                errors,
+                {
+                    "stop_error": stop_error,
+                    "still_matches_identity": still_matches,
+                    "listeners_after": listeners_after,
+                    "directory_retained": self.run_dir.exists(),
+                },
+            )
+            self.cleaned = False
+            # Keep live lock until a later successful cleanup; release only on success.
+            raise StandError(
+                f"Cleanup failed; recovery state retained: "
+                f"{({'run_id': self.run_id, 'errors': errors, 'listeners_after': listeners_after, 'still_matches': still_matches})}"
+            )
+
+        # Bound deletion to the validated immediate run_id child only.
+        try:
+            bound = bind_manifest_paths(self.profile, self.manifest, manifest_path=self.manifest_path)
+        except StandError as exc:
+            errors.append(str(exc))
+            self._record_cleanup_failure(errors)
+            self.cleaned = False
+            raise StandError(f"Cleanup failed; recovery state retained: {errors}") from exc
+        if bound.exists():
+            # Checkpoint ownership outside the tree before recursive delete.
+            try:
+                self._save_ownership_claim()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"failed to checkpoint ownership before rmtree: {exc}")
+                self._record_cleanup_failure(
+                    errors,
+                    {
+                        "stop_error": stop_error,
+                        "still_matches_identity": still_matches,
+                        "listeners_after": listeners_after,
+                        "directory_retained": True,
+                    },
+                )
+                self.cleaned = False
+                raise StandError(
+                    f"Cleanup failed; recovery state retained: "
+                    f"{({'run_id': self.run_id, 'errors': errors, 'listeners_after': listeners_after})}"
+                ) from exc
+            try:
+                shutil.rmtree(bound)
+            except OSError as exc:
+                errors.append(f"rmtree failed: {exc}")
+                self._record_cleanup_failure(
+                    errors,
+                    {
+                        "stop_error": stop_error,
+                        "still_matches_identity": still_matches,
+                        "listeners_after": listeners_after,
+                        "directory_retained": self.run_dir.exists(),
+                    },
+                )
+                self.cleaned = False
+                raise StandError(
+                    f"Cleanup failed; recovery state retained: "
+                    f"{({'run_id': self.run_id, 'errors': errors, 'listeners_after': listeners_after})}"
+                ) from exc
+        still_there = self.run_dir.exists()
+        result = {
+            "run_id": self.run_id,
+            "directory_removed": not still_there,
+            "listeners_after": listeners_after,
+            "revoke_readback": revoke_evidence,
+            "errors": errors,
+        }
+        if still_there:
+            self._record_cleanup_failure(errors + ["directory still present after rmtree"])
+            self.cleaned = False
+            raise StandError(f"Cleanup failed: {result}")
+        try:
+            self._clear_ownership_claim()
+        except StandError as exc:
+            self.cleaned = False
+            raise StandError(
+                f"Cleanup removed run dir but failed to clear ownership claim: {exc}"
+            ) from exc
+        self.cleaned = True
+        self._child = None
+        self._release_live_lock()
+        return result
+
+    def install_signal_handlers(self) -> None:
+        def _handler(signum: int, _frame: Any) -> None:
+            try:
+                self.cleanup()
+            finally:
+                raise SystemExit(128 + signum)
+
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            self._signal_handlers[signum] = signal.signal(signum, _handler)
+
+    def restore_signal_handlers(self) -> None:
+        for signum, previous in self._signal_handlers.items():
+            signal.signal(signum, previous)
+        self._signal_handlers.clear()
+
+    def _surface_secondary_cleanup_error(self, primary: BaseException) -> None:
+        secondary = self.secondary_cleanup_error
+        if secondary is None:
+            return
+        # Keep the original acquire/readiness error primary; attach secondary as note.
+        try:
+            primary.add_note(f"secondary cleanup failure: {secondary!r}")
+        except Exception:
+            pass
+
+    def _unwind_after_failed_acquire(self, *, revoke: bool = False) -> None:
+        """Best-effort owned-resource unwind when context acquisition fails.
+
+        Python does not call ``__exit__`` when ``__enter__`` raises, so this path
+        must restore process-wide signal handlers and stop only resources this
+        stand actually acquired. When cleanup cannot be verified, the recovery
+        manifest/live lock are retained. Cleanup failures must not replace the
+        original acquire failure: they are recorded on ``secondary_cleanup_error``
+        and this helper never raises.
+        """
+        def _record_secondary(exc: BaseException) -> None:
+            # Preserve the first secondary; reinforce/unwind must not clear it.
+            if self.secondary_cleanup_error is None:
+                self.secondary_cleanup_error = exc
+
+        try:
+            has_owned_process = bool(
+                self._child is not None or (self.manifest.get("process") or {}).get("pid")
+            )
+            if has_owned_process:
+                if not self.cleaned:
+                    try:
+                        self.cleanup(revoke=revoke)
+                    except BaseException as exc:
+                        # Retain recovery manifest when cleanup cannot be verified.
+                        _record_secondary(exc)
+            else:
+                # Admission / pre-start failure: never signal foreign listeners.
+                try:
+                    self._stop_watchdog()
+                    self._close_handshake()
+                    if (
+                        self._created_run_dir
+                        and self.run_dir.exists()
+                        and not (self.manifest.get("process") or {}).get("pid")
+                    ):
+                        try:
+                            self._save_ownership_claim(
+                                {"status": (self.manifest or {}).get("status") or "prepared"}
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            _record_secondary(exc)
+                        try:
+                            shutil.rmtree(self.run_dir)
+                        except OSError as exc:
+                            failure = StandError(f"pre-spawn rollback rmtree failed: {exc}")
+                            _record_secondary(failure)
+                            self._record_cleanup_failure(
+                                [str(failure)],
+                                {"directory_retained": self.run_dir.exists()},
+                            )
+                        if self.run_dir.exists():
+                            if self.secondary_cleanup_error is None:
+                                failure = StandError(
+                                    "pre-spawn rollback left owned directory"
+                                )
+                                _record_secondary(failure)
+                            if self.manifest.get("status") != "cleanup_failed":
+                                self._record_cleanup_failure(
+                                    [str(self.secondary_cleanup_error or "directory retained")],
+                                    {"directory_retained": True},
+                                )
+                        else:
+                            self._created_run_dir = False
+                            self.cleaned = True
+                            try:
+                                self._clear_ownership_claim()
+                            except StandError as exc:
+                                self.cleaned = False
+                                _record_secondary(exc)
+                    # Keep the flock only while an owned created directory remains.
+                    # Preexisting collisions / never-created dirs must release.
+                    retain_lock = bool(
+                        self._created_run_dir and self.run_dir.exists() and not self.cleaned
+                    )
+                    if not retain_lock:
+                        self._release_live_lock()
+                except BaseException as exc:
+                    _record_secondary(exc)
+        except BaseException as exc:
+            # Last-resort: unwind itself must stay non-throwing.
+            _record_secondary(exc)
+        finally:
+            try:
+                self.restore_signal_handlers()
+            except BaseException as exc:
+                _record_secondary(exc)
+            try:
+                self._stop_watchdog()
+            except BaseException as exc:
+                _record_secondary(exc)
+            try:
+                self._close_handshake()
+            except BaseException as exc:
+                _record_secondary(exc)
+            if self.cleaned:
+                try:
+                    self._release_live_lock()
+                except BaseException as exc:
+                    _record_secondary(exc)
+
+    def __enter__(self) -> "IsolatedStand":
+        self.secondary_cleanup_error = None
+        self.install_signal_handlers()
+        try:
+            self.prepare()
+            self.start()
+            self.wait_ready()
+            return self
+        except BaseException as exc:
+            self._unwind_after_failed_acquire(revoke=False)
+            self._surface_secondary_cleanup_error(exc)
+            raise
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            if not self.cleaned:
+                self.cleanup()
+        finally:
+            self.restore_signal_handlers()
+            self._stop_watchdog()
+            self._close_handshake()
+            if self.cleaned:
+                self._release_live_lock()
+
+
+def load_manifest(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StandError(f"Manifest unreadable: {path}: {exc}") from exc
+    if data.get("schema") != MANIFEST_SCHEMA:
+        raise StandError(f"Unexpected manifest schema at {path}")
+    return data
+
+
+def _pids_agree(*values: Any) -> bool:
+    present = [value for value in values if value is not None and value != ""]
+    if not present:
+        return True
+    normalized = {str(int(value)) for value in present}
+    return len(normalized) == 1
+
+
+def _durable_process_identity(manifest: dict[str, Any]) -> dict[str, str] | None:
+    """Return a strong start identity only when PID bindings are consistent."""
+    process = manifest.get("process") or {}
+    receipt = manifest.get("launch_receipt") or {}
+    identity = process.get("identity")
+    process_pid = process.get("pid")
+    receipt_pid = receipt.get("pid")
+    manifest_run_id = manifest.get("run_id")
+    receipt_run_id = receipt.get("run_id")
+
+    if receipt and receipt_run_id is not None and manifest_run_id is not None:
+        if str(receipt_run_id) != str(manifest_run_id):
+            raise StandError(
+                "Manifest/receipt run_id binding mismatch; refusing process signalling"
+            )
+
+    if isinstance(identity, dict) and identity.get("pid") and identity.get("lstart"):
+        identity_pid = identity.get("pid")
+        if not _pids_agree(identity_pid, process_pid, receipt_pid):
+            raise StandError(
+                "Manifest process PID/identity binding mismatch; "
+                "refusing process signalling"
+            )
+        return {
+            "pid": str(int(identity_pid)),
+            "lstart": str(identity.get("lstart")),
+            "args": str(identity.get("args") or ""),
+        }
+
+    receipt_identity = receipt.get("identity")
+    if (
+        isinstance(receipt_identity, dict)
+        and receipt_identity.get("pid")
+        and receipt_identity.get("lstart")
+    ):
+        identity_pid = receipt_identity.get("pid")
+        if not _pids_agree(identity_pid, process_pid, receipt_pid):
+            raise StandError(
+                "Manifest/receipt PID/identity binding mismatch; "
+                "refusing process signalling"
+            )
+        return {
+            "pid": str(int(identity_pid)),
+            "lstart": str(receipt_identity.get("lstart")),
+            "args": str(receipt_identity.get("args") or ""),
+        }
+    if process_pid is not None and receipt_pid is not None and not _pids_agree(process_pid, receipt_pid):
+        raise StandError(
+            "Manifest/receipt PID binding mismatch; refusing process signalling"
+        )
+    return None
+
+
+def _pid_still_alive(pid: int) -> bool:
+    try:
+        process_start_identity(pid)
+        return True
+    except StandError:
+        return False
+
+
+def _stop_manifest_process(manifest: dict[str, Any]) -> tuple[bool, list[str]]:
+    errors: list[str] = []
+    process = manifest.get("process") or {}
+    pid = process.get("pid")
+    try:
+        identity = _durable_process_identity(manifest)
+    except StandError as exc:
+        return False, [str(exc)]
+    stopped = False
+    if identity:
+        # Signal only the PID that was validated together with start identity.
+        signal_pid = int(identity["pid"])
+        if process_matches_identity(identity):
+            try:
+                os.kill(signal_pid, signal.SIGTERM)
+            except OSError as exc:
+                errors.append(f"SIGTERM failed: {exc}")
+            for _ in range(50):
+                if not process_matches_identity(identity):
+                    stopped = True
+                    break
+                time.sleep(0.1)
+            if process_matches_identity(identity):
+                try:
+                    os.kill(signal_pid, signal.SIGKILL)
+                except OSError as exc:
+                    errors.append(f"SIGKILL failed: {exc}")
+                time.sleep(0.2)
+                stopped = not process_matches_identity(identity)
+        else:
+            stopped = True  # PID gone or reused by unrelated process; do not kill.
+    elif pid:
+        # Never signal an identity-less PID from a receipt number alone. An
+        # unreleased handshake child exits on EOF when its manager dies; wait
+        # briefly for that self-exit, then refuse and retain unknown state.
+        for _ in range(30):
+            if not _pid_still_alive(int(pid)):
+                stopped = True
+                break
+            time.sleep(0.1)
+        if not stopped:
+            errors.append(
+                "Manifest process lacks durable start identity; "
+                "refusing blind kill of unreclaimed PID"
+            )
+            stopped = False
+    else:
+        stopped = True
+    return stopped, errors
+
+
+def cleanup_manifest(profile: StandProfile, manifest: dict[str, Any], *, manifest_path: Path | None = None) -> dict[str, Any]:
+    bound_dir = bind_manifest_paths(profile, manifest, manifest_path=manifest_path)
+    run_id = validate_run_id(str(manifest.get("run_id") or ""))
+    # Attach launch receipt into manifest view when present for pre-identity recovery.
+    receipt_path = bound_dir / LAUNCH_RECEIPT_NAME
+    if receipt_path.is_file():
+        try:
+            manifest = dict(manifest)
+            manifest["launch_receipt"] = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    # Durable outside-tree claim before any recursive delete.
+    try:
+        write_ownership_claim(profile, ownership_claim_from_manifest(manifest))
+    except StandError:
+        # Still attempt stop/delete; failure persistence below will re-raise claim errors.
+        pass
+    stopped, errors = _stop_manifest_process(manifest)
+    listeners_after = {str(port): sorted(listeners(port)) for port in profile.all_ports}
+    busy = {port: pids for port, pids in listeners_after.items() if pids}
+    try:
+        identity = _durable_process_identity(manifest)
+    except StandError as exc:
+        identity = None
+        if str(exc) not in errors:
+            errors.append(str(exc))
+    still_matches = bool(identity and process_matches_identity(identity))
+    if errors or not stopped or busy or still_matches:
+        # Retain recovery state; do not destroy the only retry information.
+        failure_payload = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "errors": errors,
+            "process_stopped": stopped,
+            "still_matches_identity": still_matches,
+            "listeners_after": listeners_after,
+            "directory_retained": True,
+        }
+        failure = {
+            "schema": MANIFEST_SCHEMA,
+            **manifest,
+            "status": "cleanup_failed",
+            "cleanup_failure": failure_payload,
+        }
+        try:
+            write_ownership_claim(profile, ownership_claim_from_manifest(failure))
+        except StandError as exc:
+            errors.append(f"failed to persist durable ownership claim: {exc}")
+        if manifest_path is not None and bound_dir.exists():
+            try:
+                atomic_write_secure(
+                    manifest_path if manifest_path.parent == bound_dir else bound_dir / "resource-manifest.json",
+                    json.dumps(failure, indent=2, sort_keys=True) + "\n",
+                    profile.sensitive_file_mode,
+                )
+            except OSError as exc:
+                errors.append(f"failed to persist in-tree cleanup_failure: {exc}")
+        raise StandError(
+            f"Orphan cleanup failed; recovery state retained: "
+            f"{({'run_id': manifest.get('run_id'), 'errors': errors, 'listeners_after': listeners_after, 'stopped': stopped})}"
+        )
+    if bound_dir.exists():
+        try:
+            shutil.rmtree(bound_dir)
+        except OSError as exc:
+            failure_payload = {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "errors": [f"rmtree failed: {exc}"],
+                "process_stopped": stopped,
+                "listeners_after": listeners_after,
+                "directory_retained": bound_dir.exists(),
+            }
+            failure = {
+                "schema": MANIFEST_SCHEMA,
+                **manifest,
+                "status": "cleanup_failed",
+                "cleanup_failure": failure_payload,
+            }
+            write_ownership_claim(profile, ownership_claim_from_manifest(failure))
+            if bound_dir.exists():
+                try:
+                    atomic_write_secure(
+                        bound_dir / "resource-manifest.json",
+                        json.dumps(failure, indent=2, sort_keys=True) + "\n",
+                        profile.sensitive_file_mode,
+                    )
+                except OSError:
+                    pass
+            raise StandError(
+                f"Orphan cleanup failed; recovery state retained: "
+                f"{({'run_id': run_id, 'errors': failure_payload['errors'], 'listeners_after': listeners_after})}"
+            ) from exc
+    result = {
+        "run_id": manifest.get("run_id"),
+        "process_stopped": stopped,
+        "directory_removed": not bound_dir.exists(),
+        "listeners_after": listeners_after,
+    }
+    if not result["directory_removed"]:
+        raise StandError(f"Orphan cleanup failed: {result}")
+    clear_ownership_claim(profile, run_id)
+    return result
+
+
+def cleanup_orphaned_runs(
+    profile: StandProfile,
+    *,
+    require_exclusive_owner: bool = True,
+    owned_live_lock: LiveRunLock | None = None,
+) -> list[dict[str, Any]]:
+    """Clean orphaned run dirs using PID/start identity under the live lock.
+
+    Every entry point must either pass an already-held LiveRunLock capability or
+    acquire the lock nonblocking. Another live owner is refused so active run
+    directories and services cannot be deleted/signalled by a concurrent recovery.
+    """
+    if not require_exclusive_owner and owned_live_lock is None:
+        raise StandError(
+            "Orphan cleanup refuses to run without exclusive live-lock ownership"
+        )
+    acquired: LiveRunLock | None = None
+    try:
+        if owned_live_lock is not None:
+            if not owned_live_lock.held:
+                raise StandError("owned live lock is not held")
+            if owned_live_lock.run_root.resolve() != profile.run_root.resolve():
+                raise StandError("owned live lock belongs to a different run_root")
+        else:
+            acquired = LiveRunLock(profile.run_root)
+            acquired.acquire()
+        results: list[dict[str, Any]] = []
+        if not profile.run_root.exists():
+            return results
+        seen: set[str] = set()
+        for child in sorted(profile.run_root.iterdir()):
+            if not child.is_dir():
+                continue
+            # Skip non run-id children (journals, lock siblings, ownership dir).
+            if child.name in {OWNERSHIP_DIR_NAME, LIVE_LOCK_NAME}:
+                continue
+            try:
+                validate_run_id(child.name)
+            except StandError:
+                continue
+            manifest_path = child / "resource-manifest.json"
+            if not manifest_path.is_file():
+                continue
+            manifest = load_manifest(manifest_path)
+            seen.add(child.name)
+            results.append(cleanup_manifest(profile, manifest, manifest_path=manifest_path))
+        # Reclaim bound directories whose in-tree manifest was erased mid-rmtree
+        # but still have a durable ownership claim outside the tree.
+        claims_root = ownership_dir(profile)
+        if claims_root.is_dir():
+            for claim_path in sorted(claims_root.glob("*.json")):
+                try:
+                    claim = json.loads(claim_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise StandError(f"Ownership claim unreadable: {claim_path}: {exc}") from exc
+                if claim.get("schema") != OWNERSHIP_SCHEMA:
+                    raise StandError(f"Unexpected ownership claim schema at {claim_path}")
+                run_id = validate_run_id(str(claim.get("run_id") or claim_path.stem))
+                if run_id in seen:
+                    continue
+                bound = assert_immediate_run_child(
+                    profile.run_root, run_id, Path(claim.get("run_dir") or (profile.run_root / run_id))
+                )
+                if not bound.exists():
+                    clear_ownership_claim(profile, run_id)
+                    continue
+                # Prefer a recreated/remaining in-tree manifest when present.
+                manifest_path = bound / "resource-manifest.json"
+                if manifest_path.is_file():
+                    manifest = load_manifest(manifest_path)
+                else:
+                    manifest = {
+                        "schema": MANIFEST_SCHEMA,
+                        "run_id": run_id,
+                        "run_dir": str(bound),
+                        "status": claim.get("status") or "cleanup_failed",
+                        "process": claim.get("process"),
+                        "launch_receipt": claim.get("launch_receipt"),
+                        "ports": claim.get("ports") or dict(profile.ports),
+                        "listen_host": claim.get("listen_host") or profile.listen_host,
+                        "cleanup_failure": claim.get("cleanup_failure"),
+                        "source": claim.get("source"),
+                        "binary": claim.get("binary"),
+                        "created_at": claim.get("created_at"),
+                    }
+                seen.add(run_id)
+                results.append(
+                    cleanup_manifest(profile, manifest, manifest_path=manifest_path)
+                )
+        return results
+    finally:
+        if acquired is not None:
+            acquired.release()
+
+
+def resolve_existing_path_prefix(path: Path) -> Path:
+    """Resolve path with symlink-safe existing prefix; keep missing leaf names."""
+    path = path.expanduser()
+    if not path.is_absolute():
+        raise StandError(f"Path must be absolute before containment checks: {path}")
+    current = path
+    missing: list[str] = []
+    while True:
+        if current.exists() or current.is_symlink():
+            resolved = current.resolve()
+            for part in reversed(missing):
+                resolved = resolved / part
+            return resolved
+        if current.parent == current:
+            raise StandError(f"Cannot resolve path containment for {path}")
+        missing.append(current.name)
+        current = current.parent
+
+
+def validate_journal_path(profile: StandProfile, journal: str | Path) -> Path:
+    """Require journal path under approved run_root, outside Git, no symlink escape."""
+    raw = Path(journal).expanduser()
+    root = profile.run_root.resolve()
+    if not raw.is_absolute():
+        candidate = root / raw
+    else:
+        candidate = raw
+    resolved = resolve_existing_path_prefix(candidate)
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError as exc:
+        raise StandError(
+            f"Journal path must stay under approved run_root {root}; got {resolved}"
+        ) from exc
+    if resolved == root or len(relative.parts) == 0:
+        raise StandError("Journal path must be a file under approved run_root, not the root itself")
+    if any(part in {".", ".."} for part in relative.parts):
+        raise StandError(f"Journal path rejected unsafe relative parts: {resolved}")
+    # Defense in depth: refuse Git worktrees even if a future profile drifts.
+    _assert_not_git_worktree(resolved.parent if resolved.parent.exists() else root)
+    return resolved
+
+
+def assert_suite_result_contract(result: Any) -> dict[str, Any]:
+    """Fail closed unless a suite reports a nonempty executed-scenario contract."""
+    if not isinstance(result, dict):
+        raise StandError(
+            f"Suite result must be a dict with executed scenarios; got {type(result).__name__}"
+        )
+    if not result:
+        raise StandError("Suite produced empty result; no scenarios executed")
+    count = result.get("executed_count")
+    if not isinstance(count, int) or count <= 0:
+        raise StandError(
+            f"Suite executed_count must be a positive int; got {count!r}"
+        )
+    return result
+
+
+def append_journal(
+    path: Path,
+    *,
+    argv: list[str],
+    rc: int,
+    suite: str,
+    mode: str,
+    extra: dict[str, Any] | None = None,
+    mode_bits: int = 0o600,
+    profile: StandProfile | None = None,
+) -> None:
+    if profile is not None:
+        path = validate_journal_path(profile, path)
+    else:
+        # Callers without a profile still must not invent parents via relative CWD.
+        if not path.is_absolute():
+            raise StandError("Journal path must be absolute when profile is not provided")
+        path = resolve_existing_path_prefix(path)
+        _assert_not_git_worktree(path.parent if path.parent.exists() else path)
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    if profile is not None:
+        # Re-check after mkdir in case of races/symlink swaps on parent.
+        path = validate_journal_path(profile, path)
+    existing: dict[str, Any]
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        existing = {"schema": JOURNAL_SCHEMA, "entries": []}
+    entry = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "argv": list(argv),
+        "rc": rc,
+        "suite": suite,
+        "mode": mode,
+    }
+    if extra:
+        entry["extra"] = extra
+    existing.setdefault("entries", []).append(entry)
+    atomic_write_secure(path, json.dumps(existing, indent=2, sort_keys=True) + "\n", mode_bits)
+
+
+def run_stand_cycle(
+    profile: StandProfile | None = None,
+    *,
+    worktree: Path | None = None,
+    revoke_token: bool = True,
+    on_ready: Callable[[IsolatedStand], None] | None = None,
+    stand: IsolatedStand | None = None,
+) -> dict[str, Any]:
+    if stand is None:
+        profile = profile or load_profile()
+        stand = IsolatedStand(profile=profile, worktree=worktree)
+    stand.secondary_cleanup_error = None
+    try:
+        with stand:
+            fixtures = stand.create_synthetic_session()
+            if on_ready is not None:
+                # Watchdog continues during callback/idle time.
+                if stand._watchdog is not None:
+                    stand._watchdog.raise_if_failed()
+                on_ready(stand)
+                if stand._watchdog is not None:
+                    stand._watchdog.raise_if_failed()
+                stand._enforce_limits()
+            revoke_evidence = None
+            if revoke_token:
+                revoke_evidence = stand.revoke_token()
+            result = {
+                "run_id": stand.run_id,
+                "readiness": stand.readiness,
+                "synthetic_ids": fixtures,
+                "revoke_readback": revoke_evidence,
+                "source": stand.manifest.get("source"),
+                "binary": stand.manifest.get("binary"),
+                "file_modes": dict(stand.file_modes),
+            }
+        result["cleanup"] = {
+            "confirmed": stand.cleaned,
+        }
+        return result
+    except BaseException as exc:
+        # Covers __enter__ failures (no __exit__) and reinforces handler restore
+        # if a with-body / cleanup path left process-wide handlers installed.
+        # Unwind is non-throwing so the original acquire/body error stays primary.
+        stand._unwind_after_failed_acquire(revoke=False)
+        stand._surface_secondary_cleanup_error(exc)
+        raise
