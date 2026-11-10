@@ -1626,6 +1626,8 @@ class IntegrationDispatcher:
                                 "observed_marker": rb_marker or None,
                             },
                         )
+                    # Test barrier: HTTP mutation committed; receipt not yet durable.
+                    self._fire_crash("after_mutation_commit_before_receipt")
                     confirmed = section.record_receipt(
                         issuer_id,
                         op_id,

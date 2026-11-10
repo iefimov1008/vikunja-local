@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "api_origin": "http://127.0.0.1:19345",
+  "project_id": 1,
+  "token_ref": {
+    "kind": "file",
+    "path": "/absolute/path/to/owner-only-token"
+  },
+  "journal_path": "/absolute/path/to/ea010-journal.sqlite3",
+  "page_size": 2,
+  "max_items_per_page": 50,
+  "profile": "read_only",
+  "browser_origin": null,
+  "issuer_id": null,
+  "trusted_write_client": false,
+  "_comment_mini_argv": "<absolute-python> <absolute-install>/scripts/ea010_mcp.py --config <absolute-owner-config>",
+  "_comment_macbook_ssh_argv": ["ssh", "-T", "-o", "BatchMode=yes", "macmini-via-cloudru-back", "<approved-fixed-remote-launcher>"],
+  "_comment_security": "Do not put tokens, real browser origins, or working device URLs in Git. Owner config stays outside the repository. Write profile and trusted_write_client are enabled only on the proven Mini host path. schema_version, token_ref, page_size and max_items_per_page follow C1 §9; cap must match a verified Vikunja max_items_per_page."
+}
