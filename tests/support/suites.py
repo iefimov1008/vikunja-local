@@ -24,6 +24,12 @@ def _journal_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[str, A
     return run_journal_suite(mode=mode, worktree=worktree, argv=argv)
 
 
+def _recovery_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[str, Any]:
+    from .recovery_suite import run_recovery_suite
+
+    return run_recovery_suite(mode=mode, worktree=worktree, argv=argv)
+
+
 def register_suite(name: str, runner: SuiteRunner) -> None:
     if not name or not str(name).strip():
         raise StandError("Suite name must be non-empty")
@@ -70,3 +76,4 @@ def _stand_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[str, Any
 register_suite("stand", _stand_suite)
 register_suite("api", _api_suite)
 register_suite("journal", _journal_suite)
+register_suite("recovery", _recovery_suite)
