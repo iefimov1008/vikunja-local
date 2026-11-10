@@ -1,6 +1,7 @@
-"""Internal Vikunja stock API helpers for EA-010 synthetic checks.
+"""Internal Vikunja stock API helpers and durable journal for EA-010 synthetic checks.
 
-Until s03/s04 land, this package is not an external writer surface.
+External MCP/Hermes writers arrive in later stages; this package is not a public
+writer surface yet.
 """
 
 from .api import (
@@ -29,14 +30,33 @@ from .dates import (
     same_instant,
     same_stock_persisted_instant,
 )
+from .journal import (
+    DeliveryState,
+    DispatchCriticalSection,
+    IntegrationJournal,
+    JournalError,
+    OperationRecord,
+    OperationState,
+    new_issuer_id,
+    new_operation_id,
+)
+from .storage import JOURNAL_SQLITE_USER_VERSION, StorageError
 
 __all__ = [
     "MSK",
     "TARGET_DUE_PRECISION",
     "ApiError",
     "ConfirmedDue",
+    "DeliveryState",
+    "DispatchCriticalSection",
     "DueKind",
+    "IntegrationJournal",
+    "JOURNAL_SQLITE_USER_VERSION",
+    "JournalError",
+    "OperationRecord",
+    "OperationState",
     "Outcome",
+    "StorageError",
     "TaskResult",
     "TokenRef",
     "VikunjaClient",
@@ -48,6 +68,8 @@ __all__ = [
     "extract_marker",
     "html_escape_user_portion",
     "is_absent_due",
+    "new_issuer_id",
+    "new_operation_id",
     "normalize_due_value",
     "require_rfc3339_instant",
     "require_target_due_second_precision",
