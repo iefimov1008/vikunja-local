@@ -1,0 +1,427 @@
+--- a/plugins/personal-tasks/dashboard/plugin_api.py
++++ b/plugins/personal-tasks/dashboard/plugin_api.py
+@@ -4,0 +5 @@
++import os
+@@ -26,0 +28,14 @@
++def _configured_hermes_origin():
++    """Exact Origin admitted by BridgeConfig.hermes_origin (EA-010 in_process)."""
++    config_path = os.environ.get("EA010_HERMES_BRIDGE_CONFIG")
++    if not config_path:
++        return None
++    try:
++        raw = json.loads(Path(config_path).read_text(encoding="utf-8")).get("hermes_origin")
++    except Exception:
++        return None
++    if not isinstance(raw, str) or not raw.strip():
++        return None
++    return raw.rstrip("/")
++
++
+@@ -38 +53,3 @@
+-        if (not origin or origin != str(request.base_url).rstrip("/")
++        # Prefer admitted BridgeConfig.hermes_origin over Host-derived base_url (C2).
++        expected = _configured_hermes_origin() or str(request.base_url).rstrip("/")
++        if (not origin or origin != expected
+@@ -66 +83 @@
+-        if code in {"conflict", "stale", "revision", "stale_revision", "source_changed", "revision_conflict", "attention_revision_conflict", "stale_source_version", "stale_proposal_requires_review"}:
++        if code in {"conflict", "stale", "revision", "stale_revision", "source_changed", "revision_conflict", "attention_revision_conflict", "stale_source_version", "stale_proposal_requires_review", "tracker_payload_conflict", "incompatible_accept_payload"}:
+@@ -105,0 +123,3 @@
++    # EA-010 s06: optional Vikunja tracker target (C2). Forbidden on reject/clarify.
++    tracker_target: Literal["vikunja"] | None = None
++    source_version: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+@@ -128,2 +148,31 @@
+-        return {"proposal": service.decision(proposal_id, change.revision, change.action,
+-                    title=change.title, due=change.due, task_id=change.task_id, note=change.note)}
++        if change.tracker_target is not None:
++            if change.action != "accept" or change.task_id:
++                raise HTTPException(422, "tracker_target допустим только при accept без task_id")
++            if not change.source_version or not change.due_confirmed or not change.title or not change.title.strip():
++                raise HTTPException(422, "Для Vikunja укажите source_version, название и подтверждённый срок")
++            # C2: due must be present explicitly as YYYY-MM-DD or null (omit ≠ null).
++            if "due" not in change.model_fields_set:
++                raise HTTPException(422, "Для Vikunja передайте due явно (YYYY-MM-DD или null)")
++            # Tracker boundary: require exact configured Origin before accept/dispatch.
++            allowed = _configured_hermes_origin()
++            origin = request.headers.get("origin")
++            if (not allowed or not origin or origin != allowed
++                    or request.headers.get("sec-fetch-site") == "cross-site"):
++                raise HTTPException(403, "Изменения доступны только из интерфейса Hermes")
++        proposal = service.decision(
++            proposal_id,
++            change.revision,
++            change.action,
++            title=change.title,
++            due=change.due,
++            task_id=change.task_id,
++            note=change.note,
++            tracker_target=change.tracker_target,
++            source_version=change.source_version,
++            due_confirmed=change.due_confirmed,
++        )
++        # Network delivery is outside Core lock; optional bridge via Core helper.
++        deliver = getattr(service, "deliver_vikunja_outbox", None)
++        if change.tracker_target == "vikunja" and callable(deliver):
++            proposal = deliver(proposal)
++        return {"proposal": proposal}
+--- a/scripts/ea_core.py
++++ b/scripts/ea_core.py
+@@ -721 +721,3 @@
+-            proposals = [self._proposal_attention(p,attention,attention_error) for p in s['proposals'].values()]
++            # Finish interrupted accept+outbox commit before projection (crash gap heal).
++            self._complete_vikunja_accept_commit(s)
++            proposals = [self._project_tracker(self._proposal_attention(p,attention,attention_error)) for p in s['proposals'].values()]
+@@ -754 +756,224 @@
+-    def decision(self, proposal_id, revision, action, title=None, due=None, task_id=None, note=''):
++
++    def _vikunja_outbox_path(self):
++        return self.home / 'vikunja_outbox.json'
++
++    def _vikunja_accept_commit_path(self):
++        return self.home / '.vikunja_accept_commit.json'
++
++    def _ea010_crash(self, point):
++        hook = getattr(self, '_ea010_crash_hook', None)
++        if callable(hook):
++            hook(point)
++
++    def _vikunja_decision_identity(self, proposal):
++        """Return the durable Vikunja accept decision when history records delivery identity.
++
++        tracker_target=vikunja and/or a non-empty event_id mark Vikunja delivery. Legacy
++        Markdown accepts lack both and stay tracker-less when the outbox row is absent.
++        """
++        if not isinstance(proposal, dict):
++            return None
++        decisions = proposal.get('decisions')
++        if not isinstance(decisions, list):
++            return None
++        for decision in decisions:
++            if not isinstance(decision, dict):
++                continue
++            event_id = decision.get('event_id')
++            if decision.get('tracker_target') == 'vikunja' or (
++                isinstance(event_id, str) and event_id.strip()
++            ):
++                return decision
++        return None
++
++    def _vikunja_outbox_row(self, store, proposal_id):
++        """Read one outbox row; map a missing ledger file to None for first-accept paths."""
++        from vikunja_local.hermes_bridge import BridgeError
++        try:
++            return store.get_by_proposal(proposal_id)
++        except BridgeError as exc:
++            if getattr(exc, 'code', None) == 'unavailable' and 'outbox_missing' in str(exc):
++                return None
++            raise
++
++    def _project_tracker(self, proposal):
++        """Attach optional proposal.tracker from durable Vikunja outbox without dispatch.
++
++        Outbox/dependency failures must not look like a legacy accept (FR-EA010-20/21):
++        when decision history records Vikunja delivery identity, raise a bounded
++        local-state CoreError so the router can report unavailable while Core acceptance
++        remains intact. Tracker-less projection is retained only for true legacy accepts.
++        """
++        identity = self._vikunja_decision_identity(proposal)
++        try:
++            from vikunja_local.hermes_bridge import BridgeError, HermesOutboxStore
++        except Exception as exc:
++            if identity is not None:
++                raise CoreError('local_state_unreadable') from exc
++            return proposal
++        store = HermesOutboxStore(self._vikunja_outbox_path())
++        try:
++            row = store.get_by_proposal(proposal.get('id') if isinstance(proposal, dict) else None)
++        except BridgeError as exc:
++            message = str(exc).lower()
++            if 'outbox_missing' in message:
++                if identity is not None:
++                    raise CoreError('local_state_unreadable') from exc
++                return proposal
++            if 'schema' in message:
++                raise CoreError('local_state_schema_changed') from exc
++            raise CoreError('local_state_unreadable') from exc
++        except (OSError, ValueError, TypeError) as exc:
++            # JSONDecodeError ⊆ ValueError; IO/permission → unreadable ledger.
++            raise CoreError('local_state_unreadable') from exc
++        if row is None:
++            if identity is not None:
++                raise CoreError('local_state_unreadable')
++            return proposal
++        out = copy.deepcopy(proposal)
++        out['tracker'] = row.tracker().as_dict()
++        return out
++
++    def _complete_vikunja_accept_commit(self, s):
++        """Finish interrupted acceptance+outbox commit under Core lock (C2)."""
++        path = self._vikunja_accept_commit_path()
++        if not path.exists():
++            return
++        try:
++            commit = json.loads(path.read_text(encoding='utf-8'))
++        except Exception as exc:
++            raise CoreError('local_state_unreadable') from exc
++        if not isinstance(commit, dict) or commit.get('schema') != 'ea010-vikunja-accept-commit/v1':
++            raise CoreError('local_state_schema_changed')
++        proposal_id = commit.get('proposal_id')
++        p = s['proposals'].get(proposal_id)
++        if not isinstance(p, dict):
++            raise CoreError('proposal_missing')
++        decision = commit.get('decision')
++        outbox_row = commit.get('outbox_row')
++        if not isinstance(decision, dict) or not isinstance(outbox_row, dict):
++            raise CoreError('local_state_schema_changed')
++        # Repair Core acceptance if state lagged the commit journal.
++        if p.get('status') != 'accepted' or not any(
++            isinstance(d, dict) and d.get('event_id') == outbox_row.get('event_id') for d in (p.get('decisions') or [])
++        ):
++            p['decisions'] = list(p.get('decisions') or [])
++            if not any(isinstance(d, dict) and d.get('event_id') == outbox_row.get('event_id') for d in p['decisions']):
++                p['decisions'].append(copy.deepcopy(decision))
++            p.update(status='accepted')
++            if int(p.get('revision') or 0) < int(commit.get('proposal_revision') or 0):
++                p['revision'] = int(commit['proposal_revision'])
++            self._save(s)
++        self._ea010_crash('after_state_before_outbox')
++        from vikunja_local.hermes_bridge import HermesOutboxStore
++        store = HermesOutboxStore(self._vikunja_outbox_path())
++        existing = self._vikunja_outbox_row(store, proposal_id)
++        if existing is None:
++            def insert(data):
++                data['by_proposal'][proposal_id] = copy.deepcopy(outbox_row)
++                data['by_event'][outbox_row['event_id']] = copy.deepcopy(outbox_row)
++            store.mutate(insert)
++        elif existing.event_id != outbox_row.get('event_id'):
++            raise CoreError('incompatible_accept_payload')
++        self._ea010_crash('after_outbox_before_commit_clear')
++        # Outbox save already dir-fsynced; clear journal only after that barrier.
++        from vikunja_local.hermes_bridge import durable_clear_path
++        durable_clear_path(path)
++
++    def _repair_vikunja_acceptance_from_outbox(self, s, proposal_id, digest, title, due, source_version):
++        """Repair Core state when outbox survived but state.json lagged (R1)."""
++        from vikunja_local.hermes_bridge import HermesOutboxStore
++        store = HermesOutboxStore(self._vikunja_outbox_path())
++        existing = self._vikunja_outbox_row(store, proposal_id)
++        if existing is None or existing.payload_digest != digest:
++            raise CoreError('incompatible_accept_payload')
++        p = s['proposals'][proposal_id]
++        if p.get('status') == 'accepted' and any(
++            isinstance(d, dict) and d.get('event_id') == existing.event_id for d in (p.get('decisions') or [])
++        ):
++            return self._project_tracker(p)
++        decision = {
++            'action': 'accept',
++            'at': existing.created_at,
++            'note': '',
++            'source_version': source_version,
++            'task_id': None,
++            'due': due,
++            'tracker_target': 'vikunja',
++            'event_id': existing.event_id,
++        }
++        p['decisions'] = list(p.get('decisions') or [])
++        p['decisions'].append(decision)
++        p.update(status='accepted')
++        p['revision'] = int(p.get('revision') or 0) + 1
++        self._save(s)
++        return self._project_tracker(p)
++
++    def deliver_vikunja_outbox(self, proposal):
++        """Deliver pending Vikunja outbox for one proposal outside Core lock.
++
++        Configured only when EA010_HERMES_BRIDGE_CONFIG points at a bridge JSON.
++        Snapshot/read/_recover never call this — legacy accepted stay undelivered.
++        """
++        tracker = proposal.get('tracker') if isinstance(proposal, dict) else None
++        if not isinstance(tracker, dict) or not tracker.get('event_id'):
++            return proposal
++        # Linked still runs bridge.deliver for live receipt check (no cached success).
++        # Refuse dispatch until acceptance+outbox commit is durable.
++        if self._vikunja_accept_commit_path().exists():
++            with self._lock():
++                s = self._inventory(self._state())
++                self._complete_vikunja_accept_commit(s)
++            proposal = self._project_tracker(proposal if isinstance(proposal, dict) else {})
++            tracker = proposal.get('tracker') if isinstance(proposal, dict) else None
++            if not isinstance(tracker, dict) or not tracker.get('event_id'):
++                return proposal
++        config_path = os.environ.get('EA010_HERMES_BRIDGE_CONFIG')
++        if not config_path:
++            return proposal
++        from vikunja_local.hermes_bridge import (
++            BridgeConfig,
++            HermesBridge,
++            HermesOutboxStore,
++            tracker_availability_projection,
++        )
++        cfg = BridgeConfig.from_mapping(json.loads(Path(config_path).read_text(encoding='utf-8')))
++        bridge = HermesBridge(cfg, HermesOutboxStore(self._vikunja_outbox_path()))
++        result = bridge.deliver(tracker['event_id'])
++        out = copy.deepcopy(proposal)
++        if result.record is None:
++            # Missing/damaged delivery record: keep historical fields, never healthy cache.
++            historical = dict(tracker)
++            avail = tracker_availability_projection(
++                outcome=result.outcome,
++                details=result.details or {'reason': 'outbox_missing'},
++            )
++            if avail is not None:
++                historical['availability'] = avail
++            out['tracker'] = historical
++            return out
++        # Preserve historical linked fields; project failed live checks for the router.
++        public = result.public_tracker()
++        out['tracker'] = public if public is not None else result.record.tracker(
++            live_outcome=result.outcome,
++            live_details=result.details,
++        ).as_dict()
++        return out
++
++    def recover_vikunja_outbox(self, event_id=None):
++        """Recover explicit Vikunja outbox rows only; never Markdown legacy accepts."""
++        if self._vikunja_accept_commit_path().exists():
++            with self._lock():
++                s = self._inventory(self._state())
++                self._complete_vikunja_accept_commit(s)
++        config_path = os.environ.get('EA010_HERMES_BRIDGE_CONFIG')
++        if not config_path:
++            return []
++        from vikunja_local.hermes_bridge import BridgeConfig, HermesBridge, HermesOutboxStore
++        cfg = BridgeConfig.from_mapping(json.loads(Path(config_path).read_text(encoding='utf-8')))
++        bridge = HermesBridge(cfg, HermesOutboxStore(self._vikunja_outbox_path()))
++        if event_id:
++            return [bridge.recover(event_id)]
++        return bridge.recover_all_outbox()
++
++    def decision(self, proposal_id, revision, action, title=None, due=None, task_id=None, note='', tracker_target=None, source_version=None, due_confirmed=False):
+@@ -761,0 +987 @@
++            self._complete_vikunja_accept_commit(s)
+@@ -766 +992,16 @@
+-                return copy.deepcopy(p)  # Retry after lost response, including old revision.
++                # Retry after lost response, including old revision. Changed Vikunja payload → 409.
++                self._complete_vikunja_accept_commit(s)
++                if tracker_target == 'vikunja':
++                    from vikunja_local.hermes_bridge import HermesOutboxStore, acceptance_payload_digest
++                    title_chk = _string(title if title is not None else p.get('text'), 500).strip()
++                    due_chk = due
++                    if not isinstance(source_version, str):
++                        raise CoreError('incompatible_accept_payload')
++                    digest = acceptance_payload_digest(title=title_chk, due=due_chk, source_version=source_version)
++                    existing = self._vikunja_outbox_row(HermesOutboxStore(self._vikunja_outbox_path()), proposal_id)
++                    if existing is None or existing.payload_digest != digest:
++                        raise CoreError('incompatible_accept_payload')
++                    # Ensure durable decision history even if prior crash left outbox orphan.
++                    if not any(isinstance(d, dict) and d.get('event_id') == existing.event_id for d in (p.get('decisions') or [])):
++                        return self._repair_vikunja_acceptance_from_outbox(s, proposal_id, digest, title_chk, due_chk, source_version)
++                return self._project_tracker(p)
+@@ -778,0 +1020,108 @@
++                if tracker_target is not None:
++                    if tracker_target != 'vikunja':
++                        raise CoreError('invalid_tracker_target')
++                    if task_id:
++                        raise CoreError('invalid_tracker_with_task_id')
++                    if not due_confirmed:
++                        raise CoreError('invalid_due_confirmation')
++                    if not isinstance(source_version, str) or not re.fullmatch(r'[a-f0-9]{64}', source_version):
++                        raise CoreError('invalid_source_version')
++                    if source_version != p['version']:
++                        raise CoreError('stale_source_version')
++                    self._complete_vikunja_accept_commit(s)
++                    # Durable acceptance + outbox under the same Core lock. No Markdown create.
++                    from vikunja_local.hermes_bridge import (
++                        HermesOutboxStore,
++                        acceptance_payload_digest,
++                        confirmed_due_from_accept,
++                        durable_clear_path,
++                        format_meeting_when,
++                        frozen_due_payload,
++                        meeting_user_portion,
++                        new_event_id,
++                        proposal_source_url,
++                        verified_meeting_provenance,
++                    )
++                    store = HermesOutboxStore(self._vikunja_outbox_path())
++                    digest = acceptance_payload_digest(title=title, due=due, source_version=source_version)
++                    existing = self._vikunja_outbox_row(store, proposal_id)
++                    if existing is not None:
++                        if existing.payload_digest != digest:
++                            raise CoreError('incompatible_accept_payload')
++                        return self._repair_vikunja_acceptance_from_outbox(
++                            s, proposal_id, digest, title, due, source_version
++                        )
++                    # Provenance from canonical calendar projection only (not inventory summary).
++                    # BR-05 / FR-EA010-06: block accept until verified title+time exist.
++                    calendar_map, _calendar_errors = self._calendar(s)
++                    cal_title, cal_starts, cal_tz = verified_meeting_provenance(
++                        calendar_map.get(p['meeting_id'])
++                    )
++                    if not (cal_title and cal_starts and cal_tz):
++                        raise CoreError('invalid_meeting_provenance')
++                    meeting_title = cal_title
++                    meeting_when = format_meeting_when(starts_at=cal_starts, timezone_name=cal_tz)
++                    hermes_origin = None
++                    config_path = os.environ.get('EA010_HERMES_BRIDGE_CONFIG')
++                    if config_path:
++                        try:
++                            hermes_origin = json.loads(Path(config_path).read_text(encoding='utf-8')).get('hermes_origin')
++                        except Exception:
++                            hermes_origin = None
++                    source_url = None
++                    if isinstance(hermes_origin, str) and hermes_origin:
++                        source_url = proposal_source_url(hermes_origin=hermes_origin, proposal_id=proposal_id)
++                    portion = meeting_user_portion(
++                        proposal_id=proposal_id,
++                        meeting_id=p['meeting_id'],
++                        meeting_title=meeting_title,
++                        meeting_when=meeting_when,
++                        quote=p.get('quote'),
++                        version=p['version'],
++                        source_url=source_url,
++                    )
++                    event_id = new_event_id()
++                    now_s = now()
++                    frozen = frozen_due_payload(confirmed_due_from_accept(due))
++                    row = {
++                        'event_id': event_id,
++                        'proposal_id': proposal_id,
++                        'payload_digest': digest,
++                        'title': title,
++                        'due': due,
++                        'source_version': source_version,
++                        'state': 'pending',
++                        'user_portion': portion,
++                        'created_at': now_s,
++                        'updated_at': now_s,
++                        'operation_id': None,
++                        'task_id': None,
++                        'url': None,
++                        'frozen_due': frozen,
++                        'source_url': source_url,
++                        'details': {},
++                    }
++                    decision.update(task_id=None, due=due, tracker_target='vikunja', event_id=event_id, source_version=source_version)
++                    next_revision = int(p.get('revision') or 0) + 1
++                    commit = {
++                        'schema': 'ea010-vikunja-accept-commit/v1',
++                        'proposal_id': proposal_id,
++                        'decision': copy.deepcopy(decision),
++                        'outbox_row': copy.deepcopy(row),
++                        'proposal_revision': next_revision,
++                        'at': now_s,
++                    }
++                    # Recoverable commit protocol: staging → state → outbox → clear.
++                    _atomic(self._vikunja_accept_commit_path(), (json.dumps(commit, ensure_ascii=False, indent=2)+'\n').encode())
++                    p['decisions'].append(decision)
++                    p.update(status='accepted')
++                    p['revision'] = next_revision
++                    self._save(s)
++                    self._ea010_crash('after_state_before_outbox')
++                    def insert(data):
++                        data['by_proposal'][proposal_id] = copy.deepcopy(row)
++                        data['by_event'][event_id] = copy.deepcopy(row)
++                    store.mutate(insert)
++                    self._ea010_crash('after_outbox_before_commit_clear')
++                    durable_clear_path(self._vikunja_accept_commit_path())
++                    return self._project_tracker(p)

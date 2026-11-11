@@ -1,0 +1,57 @@
+{
+  "baseline_absolute": {
+    "ea_core.py": "/Users/efimovivan/Projects/cto-agent-environment/scripts/ea_core.py",
+    "plugin_api.py": "/Users/efimovivan/Projects/cto-agent-environment/plugins/personal-tasks/dashboard/plugin_api.py"
+  },
+  "c2_contract_sha256": "2ba910b1ada14a774d3b38891406473d11f071a58ba63e2cdf773025d02492d5",
+  "mode": "isolated_synthetic_only",
+  "notes": [
+    "Patch is reproducible against the approved C5 synthetic baseline hashes only.",
+    "Do not apply to production checkout from this stage; separate C5 apply/rollback decision required.",
+    "Patch regenerated with diff -U0 so blank unified-diff context lines do not trip new-file git --check.",
+    "s06 R1-R7 + F1-F4: concurrent source claim, calendar provenance, configured Origin, conflict projection.",
+    "Round fix: outbox/parent-dir fsync + durable journal clear order; block accept/deliver without verified meeting title/time.",
+    "R1 linked-then-deleted: Core.deliver_vikunja_outbox no longer short-circuits linked rows; bridge.deliver/recover run live receipt checks.",
+    "R1 deleted/denied linked target: Core.deliver_vikunja_outbox returns bounded tracker.availability (historical linked fields preserved).",
+    "R1 outbox unavailable on snapshot: Core._project_tracker raises local_state_unreadable/schema_changed instead of dropping tracker.",
+    "R1: snapshot completes interrupted accept commit before tracker projection; missing outbox/import with Vikunja identity → local_state_unreadable.",
+    "R1 incomplete outbox indexes: reject missing/mistyped by_event|by_proposal and cross-index identity drift; deliver_vikunja_outbox projects availability when record is None.",
+    "R1 frozen_due.wire drift: validate absolute instant + Europe/Moscow against confirm_date_only(accepted due, confirmed_at) before deliver/recover intent; refuse without rewriting due."
+  ],
+  "patch": {
+    "path": "integration/hermes/backend.patch",
+    "sha256": "0eb9c821abae133f2f57d75d9c9c03c2d20c6585567d8c9120d9bfd26ea5f8a6"
+  },
+  "production_apply": false,
+  "schema": "ea010-hermes-backend-manifest/v1",
+  "sources": [
+    {
+      "from_sha256": "938dc648daee8f5484a76de6bac0ed86f79b28463c89a1d17c6af02e833b0f51",
+      "path": "plugins/personal-tasks/dashboard/plugin_api.py",
+      "regions": [
+        "authorize: exact BridgeConfig.hermes_origin (not Host/base_url)",
+        "Decision model: tracker_target + source_version",
+        "decision handler: tracker validation + configured Origin + model_fields_set(due) + deliver_vikunja_outbox",
+        "invoke conflict codes: tracker_payload_conflict / incompatible_accept_payload"
+      ],
+      "to_sha256": "c200627f38b4cea8b5f979f8fa1394def53082d72fcde66f6be10d40a1ec8c77"
+    },
+    {
+      "from_sha256": "23deacba5cca06d314c5ec5717bbb3f6dd7f074974670324ab7f64baaecf10ef",
+      "path": "scripts/ea_core.py",
+      "regions": [
+        "Core._vikunja_outbox_path / accept commit protocol / _project_tracker / deliver / recover",
+        "decision(...): durable accept+outbox under lock; verified calendar provenance required; frozen due + source URL",
+        "durable_clear_path after outbox dir barrier; invalid_meeting_provenance when title/time unavailable",
+        "snapshot projects tracker without dispatch",
+        "Markdown _recover unchanged",
+        "deliver_vikunja_outbox projects failed live-check availability onto proposal.tracker",
+        "snapshot/_project_tracker: outbox read/schema/IO → local_state_* CoreError (not silent legacy)",
+        "snapshot/_project_tracker: Vikunja decision identity + missing outbox/import → local_state_unreadable",
+        "deliver_vikunja_outbox: missing delivery record → historical tracker + bounded availability (not cached healthy link)"
+      ],
+      "to_sha256": "060a22948ac4154fbf2e5dd6c5699c2d887b32c7d312fd5f8ccc5982a7a11d49"
+    }
+  ],
+  "stage": "s06-hermes-bridge"
+}
