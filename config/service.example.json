@@ -1,0 +1,59 @@
+{
+  "schema": "ea010-service-config/v1",
+  "supervisor_label": "local.cto.vikunja",
+  "contour": "isolated_synthetic",
+  "reuse_existing_supervisor": true,
+  "forbid_second_supervisor": true,
+  "post_login_pilot": "Autostart is RunAtLoad after macOS user login. Pre-login and FileVault-locked unavailability are accepted pilot limits; FileVault, sleep, SSH, and power settings are not changed by EA-010 tools.",
+  "admitted_program_arguments": [
+    "/absolute/path/to/vikunja-v2.8.0-darwin-10.15-arm64",
+    "--config",
+    "/absolute/path/to/config.json"
+  ],
+  "paths": {
+    "contour_root": "/absolute/path/to/admitted-synthetic-root",
+    "plist": "/absolute/path/to/LaunchAgents/local.cto.vikunja.plist",
+    "config": "/absolute/path/to/config.json",
+    "installation_manifest": "/absolute/path/to/installation.json",
+    "database": "/absolute/path/to/vikunja.db",
+    "files": "/absolute/path/to/files",
+    "binary": "/absolute/path/to/vikunja-v2.8.0-darwin-10.15-arm64",
+    "rehearsal_manifest": "/absolute/path/to/hermes-patch-rehearsal.json"
+  },
+  "observed_read_only_bindings_doc": {
+    "path": "/Users/efimovivan/.local/state/cto-agent-environment/real-flows/rf-17bd4e51a4b66a1d1d902871/driver/s08-review/EA-010 C4 observed Mini bindings.md",
+    "sha256": "97fb13487a3437a93a4fb5bfa0460156aa7822c89e7f49c16723b4dd3d3e78b6",
+    "role": "read_only_preflight_evidence_not_write_whitelist"
+  },
+  "c4_c5_scope": {
+    "path": "/Users/efimovivan/.local/state/cto-agent-environment/real-flows/rf-17bd4e51a4b66a1d1d902871/driver/s08-review/EA-010 C4 C5 lifecycle scope 0.1.md",
+    "sha256": "772a44d23db6a113a7a57dd02a40abdf51e114917e11b516cebd826e47565def"
+  },
+  "bind": {
+    "interface": "127.0.0.1:9345",
+    "note": "Production bind is evidence only; synthetic stands use the admitted profile ports."
+  },
+  "mcp_recipe": {
+    "mini_argv_template": [
+      "<absolute-python>",
+      "<absolute-install>/scripts/ea010_mcp.py",
+      "--config",
+      "<absolute-owner-config>"
+    ],
+    "macbook_ssh_argv_template": [
+      "ssh",
+      "-T",
+      "-o",
+      "BatchMode=yes",
+      "macmini-via-cloudru-back",
+      "<approved-fixed-remote-launcher>"
+    ],
+    "note": "No credentials, tokens, or real device URLs belong in this recipe or in Git."
+  },
+  "defaults": {
+    "mode": "dry-run",
+    "production_apply": false,
+    "synthetic_only": true
+  },
+  "_security": "Owner secrets, tokens, and live task/meeting data stay on Mini outside Git. Never pass secrets on argv. Working Mini paths are read-only evidence, not a write whitelist."
+}

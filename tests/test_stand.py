@@ -996,8 +996,20 @@ while True:
             get_suite(None)  # type: ignore[arg-type]
         with self.assertRaises(StandError):
             get_suite("no-such-suite")
-        # s02 api + s03 journal + s04 recovery + s05 mcp; retain unknown/empty negatives.
-        self.assertEqual(list_suites(), ["api", "journal", "mcp", "recovery", "stand"])
+        # Registered verify suites across stages; retain unknown/empty negatives.
+        self.assertEqual(
+            list_suites(),
+            [
+                "api",
+                "hermes-bridge",
+                "hermes-ux",
+                "journal",
+                "lifecycle",
+                "mcp",
+                "recovery",
+                "stand",
+            ],
+        )
         verify = ROOT / "scripts" / "ea010_verify.py"
         unknown = subprocess.run(
             [sys.executable, str(verify), "--suite", "nope", "--mode", "isolated"],

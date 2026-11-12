@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ea010-hermes-patch-rehearsal/v1",
+  "title": "EA-010 Hermes three-patch disposable rehearsal manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "contour",
+    "contour_root",
+    "production_apply",
+    "default_mode",
+    "patch_rehearsal_procedure_sha256",
+    "test_session",
+    "preserve"
+  ],
+  "properties": {
+    "schema": {
+      "const": "ea010-hermes-patch-rehearsal/v1"
+    },
+    "contour": {
+      "const": "isolated_synthetic",
+      "description": "Only disposable synthetic contours are admitted. No production apply path."
+    },
+    "contour_root": {
+      "type": "string",
+      "description": "Absolute disposable root; must be a child of the approved stand run-root."
+    },
+    "production_apply": {
+      "const": false
+    },
+    "default_mode": {
+      "const": "dry-run"
+    },
+    "patch_rehearsal_procedure_sha256": {
+      "const": "6286618c4fe26a197db1526b1fe31ffd24257c06f62c149409db6d090144ba34",
+      "description": "Coordinator rehearsal procedure for backend.patch → ui-readiness.patch → ui.patch."
+    },
+    "owner_scope_clarification_sha256": {
+      "const": "f50fa84a380c9538b2dfcc3ab4363ab07cd9fa4775acaa569687ee75317f10d4"
+    },
+    "test_session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled_flag_path"],
+      "description": "Synthetic test-session send marker paused before reverse apply; not an MCP/Hermes/dispatcher gate.",
+      "properties": {
+        "enabled_flag_path": {
+          "type": "string"
+        }
+      }
+    },
+    "preserve": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "kind"],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["journal", "pending", "receipt", "backlink"]
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
