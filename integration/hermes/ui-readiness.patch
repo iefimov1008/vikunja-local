@@ -1,0 +1,340 @@
+--- a/plugins/personal-tasks/dashboard/plugin_api.py
++++ b/plugins/personal-tasks/dashboard/plugin_api.py
+@@ -95,0 +96,140 @@
++
++
++
++def _verified_http_origin(value):
++    """Admit absolute http(s) origin only (no path/query/userinfo); fail closed."""
++    if not isinstance(value, str) or not value.strip():
++        return None
++    raw = value.strip()
++    lowered = raw.lower()
++    if "example" in lowered or "changeme" in lowered:
++        return None
++    try:
++        from urllib.parse import urlsplit
++        parts = urlsplit(raw)
++        # Invalid ports raise ValueError on .port access — contain here.
++        port = parts.port
++    except Exception:
++        return None
++    if parts.scheme not in {"http", "https"} or not parts.hostname:
++        return None
++    if parts.username is not None or parts.password is not None:
++        return None
++    if parts.path not in ("", "/") or parts.query or parts.fragment:
++        return None
++    host = parts.hostname
++    if ":" in host and not host.startswith("["):
++        host = f"[{host}]"
++    if port is not None:
++        return f"{parts.scheme}://{host}:{port}"
++    return f"{parts.scheme}://{host}"
++
++
++def _verified_browser_origin(value):
++    """Admit C3 browser origin only (absolute http(s), no path/query/userinfo)."""
++    return _verified_http_origin(value)
++
++
++def _bounded_timeout_s(value, default=1.5):
++    """Finite positive timeout capped for readiness probes."""
++    try:
++        timeout_s = float(default if value is None else value)
++    except (TypeError, ValueError):
++        return default
++    import math
++    if not math.isfinite(timeout_s) or timeout_s <= 0 or timeout_s > 30:
++        return default
++    return timeout_s
++
++
++def _read_bridge_writer():
++    """Admit writer via BridgeConfig + VikunjaClient gates before any token/request.
++
++    Reuses C1 §9 loopback origin normalization and TokenRef.load (mode/symlink/parent)
++    so readiness cannot bypass the accepted adapter security boundary (NFR-02/03).
++    """
++    path = os.environ.get("EA010_HERMES_BRIDGE_CONFIG")
++    if not path:
++        return None
++    try:
++        raw = json.loads(Path(path).read_text(encoding="utf-8"))
++    except Exception:
++        return None
++    if not isinstance(raw, dict):
++        return None
++    try:
++        from vikunja_local.api import ApiError, VikunjaClient
++        from vikunja_local.hermes_bridge import BridgeConfig, BridgeError
++        cfg = BridgeConfig.from_mapping(raw)
++        # Origin gate runs inside VikunjaClient.__init__ before token retention.
++        client = VikunjaClient(
++            api_origin=cfg.api_origin,
++            project_id=cfg.project_id,
++            token_ref=cfg.token_ref,
++        )
++        secret = client.token_ref.load()
++    except Exception:
++        # BridgeError/ApiError/OSError/TypeError — fail closed, never probe.
++        return None
++    if not secret:
++        return None
++    return {"api_origin": client.api_origin, "project_id": client.project_id, "token": secret}
++
++
++def _probe_project_ready(api_origin, project_id, token, timeout_s):
++    """Read-only project probe via tasks list; never creates tasks or touches outbox.
++
++    One absolute monotonic deadline covers connect/headers/body (C5 0.2). Idle
++    socket timeouts alone are not enough against trickled responses.
++
++    Uses http.client directly: no env/system proxy discovery and no redirect
++    following, so Authorization stays on the admitted loopback writer (NFR-02/03).
++    Expects a JSON array body from the admitted writer origin.
++    """
++    import http.client
++    import socket
++    import time
++    from urllib.parse import urlsplit
++
++    origin = str(api_origin).rstrip("/")
++    # Re-run writer origin gate (loopback) — never probe a non-admitted host.
++    try:
++        from vikunja_local.api import _DeadlineSocket, _normalize_api_origin
++        admitted = _normalize_api_origin(origin)
++    except Exception:
++        return False
++    if not admitted:
++        return False
++    try:
++        pid = int(project_id)
++    except (TypeError, ValueError, OverflowError):
++        return False
++    if pid <= 0:
++        return False
++    parts = urlsplit(admitted)
++    host = parts.hostname
++    if not host or parts.scheme not in {"http", "https"}:
++        return False
++    try:
++        port = parts.port or (443 if parts.scheme == "https" else 80)
++    except Exception:
++        return False
++    # Confirm the connection target matches the admitted origin (no redirect hop).
++    if ":" in host and not host.startswith("["):
++        host_fmt = f"[{host}]"
++    else:
++        host_fmt = host
++    if parts.port is not None:
++        landed = f"{parts.scheme}://{host_fmt}:{parts.port}"
++    else:
++        landed = f"{parts.scheme}://{host_fmt}"
++    if _verified_http_origin(landed) != admitted:
++        return False
++    path = f"/api/v1/projects/{pid}/tasks?per_page=1&page=1"
++    try:
++        budget = float(timeout_s)
++    except (TypeError, ValueError):
++        return False
++    if budget <= 0:
++        return False
++    deadline = time.monotonic() + budget
+@@ -96,0 +237,5 @@
++    def _remaining():
++        left = deadline - time.monotonic()
++        if left <= 0:
++            raise TimeoutError("readiness budget exhausted")
++        return left
+@@ -97,0 +243,87 @@
++    body = b""
++    try:
++        connect_cap = _remaining()
++        if parts.scheme == "https":
++            conn = http.client.HTTPSConnection(host, port, timeout=connect_cap)
++        else:
++            conn = http.client.HTTPConnection(host, port, timeout=connect_cap)
++        try:
++            conn.connect()
++            raw_sock = conn.sock
++            if raw_sock is None:
++                return False
++            # Wrap before request/getresponse so status/header parsing shares the budget.
++            deadline_sock = _DeadlineSocket(raw_sock, deadline)
++            conn.sock = deadline_sock
++            raw_sock.settimeout(_remaining())
++            conn.request(
++                "GET",
++                path,
++                headers={
++                    "Authorization": f"Bearer {token}",
++                    "Accept": "application/json",
++                    "Connection": "close",
++                },
++            )
++            raw_sock.settimeout(_remaining())
++            resp = conn.getresponse()
++            if int(resp.status) != 200:
++                return False
++            chunks = []
++            total = 0
++            while True:
++                left = _remaining()
++                try:
++                    deadline_sock.settimeout(left)
++                except OSError:
++                    pass
++                # read1 returns after at most one underlying recv so a slow stream
++                # cannot hide inside one Content-Length-sized idle-timeout read().
++                chunk = resp.read1(65536)
++                if not chunk:
++                    break
++                total += len(chunk)
++                if total > 65536:
++                    return False
++                chunks.append(chunk)
++            body = b"".join(chunks)
++        finally:
++            try:
++                conn.close()
++            except Exception:
++                pass
++    except (TimeoutError, socket.timeout, OSError, http.client.HTTPException, ValueError, OverflowError):
++        return False
++    try:
++        parsed = json.loads(body.decode("utf-8"))
++    except Exception:
++        return False
++    return isinstance(parsed, list)
++
++
++def _ui_tracker_surface():
++    """Server-backed snapshot.tracker.{ready,ui_url}; fail closed without writer/profile."""
++    try:
++        ui_url = None
++        path = os.environ.get("EA010_HERMES_UI_PROFILE")
++        timeout_s = 1.5
++        if path:
++            try:
++                raw = json.loads(Path(path).read_text(encoding="utf-8"))
++            except Exception:
++                raw = None
++            if isinstance(raw, dict):
++                ui_url = _verified_browser_origin(raw.get("browser_origin"))
++                timeout_s = _bounded_timeout_s(raw.get("timeout_s"), 1.5)
++        writer = _read_bridge_writer()
++        if writer is None:
++            return {"ready": False, "ui_url": ui_url}
++        ready = _probe_project_ready(
++            writer["api_origin"], writer["project_id"], writer["token"], timeout_s
++        )
++        return {"ready": bool(ready), "ui_url": ui_url}
++    except Exception:
++        # Never poison meetings snapshot with readiness configuration faults (C5).
++        return {"ready": False, "ui_url": None}
++
++
+@@ -102 +334 @@
+-        return {**view, "checked_at": datetime.now(timezone.utc).isoformat(),
++        return {**view, "tracker": _ui_tracker_surface(), "checked_at": datetime.now(timezone.utc).isoformat(),
+@@ -179,0 +412,3 @@
++class TrackerRecover(BaseModel):
++    model_config = ConfigDict(extra="forbid", strict=True)
++    event_id: str = Field(pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+@@ -181,0 +417,23 @@
++@router.post("/proposals/{proposal_id}/tracker/recover")
++def tracker_recover(proposal_id: str, body: TrackerRecover, request: Request):
++    """C5 0.3: owner-only reconcile for an existing Vikunja accept event (no first PUT)."""
++    def write(service):
++        allowed = _configured_hermes_origin()
++        origin = request.headers.get("origin")
++        if (not allowed or not origin or origin != allowed
++                or request.headers.get("sec-fetch-site") == "cross-site"):
++            raise HTTPException(403, "Изменения доступны только из интерфейса Hermes")
++        recover = getattr(service, "recover_vikunja_outbox", None)
++        if not callable(recover):
++            raise HTTPException(503, "Восстановление передачи недоступно")
++        proposal = recover(
++            event_id=body.event_id,
++            allow_first_http=False,
++            proposal_id=proposal_id,
++        )
++        return {"proposal": proposal}
++    return invoke(request, write, write=True)
++
++
++
++
+--- a/scripts/ea_core.py
++++ b/scripts/ea_core.py
+@@ -963,2 +963,6 @@
+-    def recover_vikunja_outbox(self, event_id=None):
+-        """Recover explicit Vikunja outbox rows only; never Markdown legacy accepts."""
++    def recover_vikunja_outbox(self, event_id=None, allow_first_http=True, proposal_id=None):
++        """Recover explicit Vikunja outbox rows only; never Markdown legacy accepts.
++
++        UI recover (C5 0.3): proposal_id + event_id + allow_first_http=False validates
++        the Vikunja acceptance pair, refuses first PUT, and returns projected proposal.
++        """
+@@ -968,0 +973,57 @@
++        if proposal_id is not None:
++            if not event_id:
++                raise CoreError('validation')
++            with self._lock():
++                s = self._inventory(self._state())
++                self._recover(s)
++                self._complete_vikunja_accept_commit(s)
++                p = s['proposals'].get(proposal_id)
++                if not p:
++                    raise CoreError('proposal_missing')
++                identity = self._vikunja_decision_identity(p)
++                if not identity:
++                    raise CoreError('proposal_missing')
++                if identity.get('event_id') != event_id:
++                    raise CoreError('tracker_payload_conflict')
++            config_path = os.environ.get('EA010_HERMES_BRIDGE_CONFIG')
++            result = None
++            if config_path:
++                from vikunja_local.hermes_bridge import (
++                    BridgeConfig,
++                    HermesBridge,
++                    HermesOutboxStore,
++                    tracker_availability_projection,
++                )
++                cfg = BridgeConfig.from_mapping(json.loads(Path(config_path).read_text(encoding='utf-8')))
++                bridge = HermesBridge(cfg, HermesOutboxStore(self._vikunja_outbox_path()))
++                result = bridge.recover(event_id, allow_first_http=allow_first_http)
++            with self._lock():
++                s = self._inventory(self._state())
++                p = s['proposals'].get(proposal_id)
++                if not p:
++                    raise CoreError('proposal_missing')
++                out = self._project_tracker(p)
++                if result is None:
++                    return out
++                # Preserve bounded DeliveryResult/public_tracker (C5 0.3): keep historical
++                # identity and expose failed/unknown recover diagnostics — never drop the
++                # bridge outcome so UI cannot treat a failed recover as delivered.
++                tracker = out.get('tracker') if isinstance(out, dict) else None
++                out = copy.deepcopy(out) if isinstance(out, dict) else {}
++                if result.record is None:
++                    historical = dict(tracker or {})
++                    avail = tracker_availability_projection(
++                        outcome=result.outcome,
++                        details=result.details or {'reason': 'outbox_missing'},
++                    )
++                    if avail is not None:
++                        historical['availability'] = avail
++                    if historical:
++                        out['tracker'] = historical
++                    return out
++                public = result.public_tracker()
++                out['tracker'] = public if public is not None else result.record.tracker(
++                    live_outcome=result.outcome,
++                    live_details=result.details,
++                ).as_dict()
++                return out
+@@ -976 +1037 @@
+-            return [bridge.recover(event_id)]
++            return [bridge.recover(event_id, allow_first_http=allow_first_http)]

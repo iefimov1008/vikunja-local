@@ -1,0 +1,144 @@
+--- a/plugins/personal-tasks/dashboard/dist/index.js
++++ b/plugins/personal-tasks/dashboard/dist/index.js
+@@ -81,2 +81,2 @@
+-      if (!tracker?.ready || proposal.stale || !fields?.title?.trim() || !fields.due_confirmed) throw new Error("Подтвердите название и срок; подключение трекера должно быть готово");
+-      return {revision: proposal.revision, action, title: fields.title.trim(), due: fields.due || null, due_confirmed: true, note: note || ""};
++      if (!tracker?.ready || proposal.stale || !fields?.title?.trim() || !fields.due_confirmed || !proposal.version) throw new Error("Подтвердите название и срок; подключение трекера должно быть готово");
++      return {revision: proposal.revision, action, title: fields.title.trim(), due: fields.due || null, due_confirmed: true, note: note || "", tracker_target: "vikunja", source_version: proposal.version};
+@@ -86,0 +87,49 @@
++  function deliveryPresentation(proposal) {
++    const tracker = proposal?.tracker, avail = tracker?.availability, observation = tracker?.done_observation || proposal?.done_observation;
++    const observationNote = (observation && observation.checked_at)
++      ? (" · Последнее известное выполнение: " + (observation.done ? "выполнена" : "не выполнена") + " · прочитано: " + observation.checked_at + " (не актуальный статус)")
++      : "";
++    if (avail && (avail.status === "denied" || avail.outcome === "auth_denied" || avail.outcome === "scope_denied")) {
++      return {kind: "denied", label: "Нет доступа к связанной задаче" + (avail.reason ? ": " + avail.reason : "") + observationNote, action: "check_connection", url: null};
++    }
++    // Wire deletion reasons from bridge live-check (no Outcome.deleted); keep action=null.
++    if (avail && (avail.reason === "target_deleted_or_gone" || avail.reason === "linked_task_unreadable_or_gone")) {
++      return {kind: "deleted", label: "Связанная задача недоступна" + observationNote, action: null, url: null};
++    }
++    // Backlink/receipt mismatch projects status=conflict — reconcile, not deletion.
++    if (avail && avail.status === "conflict") {
++      return {kind: "conflict", label: "Передача требует проверки" + (avail.reason ? ": " + avail.reason : "") + observationNote, action: "reconcile", url: safeURL(tracker?.url || null)};
++    }
++    // Failed recover without first PUT keeps historical identity + unknown diagnostic.
++    if (avail && (avail.outcome === "unknown" || avail.reason === "no_source_mapping" || avail.reason === "prepared_without_dispatch")) {
++      return {kind: "unknown", label: "Проверяем результат передачи" + (avail.reason ? ": " + avail.reason : "") + observationNote, action: "reconcile", url: safeURL(tracker?.url || null)};
++    }
++    if (avail && (avail.status === "unavailable" || avail.outcome === "dependency_unavailable")) {
++      return {kind: "unavailable", label: "Связанная задача недоступна" + (avail.reason ? ": " + avail.reason : "") + observationNote, action: "check_connection", url: null};
++    }
++    if (observation && observation.checked_at) {
++      const mark = observation.done ? "выполнена" : "не выполнена";
++      return {kind: "done_observed", label: "Последнее известное исполнение: " + mark + " · прочитано: " + observation.checked_at + " (не актуальный статус)", action: null, url: safeURL(tracker?.url || proposal?.task_target?.url || null)};
++    }
++    if (tracker?.state === "pending") return {kind: "accepted_pending", label: "Принято · передаём в Vikunja", action: null, url: null};
++    if (tracker?.state === "unknown") return {kind: "unknown", label: "Проверяем результат передачи", action: "reconcile", url: null};
++    if (tracker?.state === "conflict") return {kind: "conflict", label: "Передача требует проверки", action: "reconcile", url: safeURL(tracker.url)};
++    if (tracker?.state === "linked" && tracker.task_id != null && !tracker.url) return {kind: "lost_backlink", label: "Задача найдена · восстанавливаем связь · №" + tracker.task_id, action: "reconcile", url: null};
++    if (tracker?.state === "linked" && (tracker.url || tracker.task_id != null)) {
++      return {kind: "delivered", label: "Передано в Vikunja" + (tracker.task_id != null ? " · №" + tracker.task_id : ""), action: null, url: safeURL(tracker.url)};
++    }
++    if (proposal?.task_target?.url || proposal?.task_id) return {kind: "legacy", label: null, action: null, url: safeURL(proposal.task_target?.url || null)};
++    return null;
++  }
++  function proposalSourceUrl(proposal, location) {
++    if (!proposal?.id) return null;
++    if (typeof proposal.source_url === "string" && proposal.source_url) {
++      const admitted = safeURL(proposal.source_url);
++      if (admitted) return admitted;
++    }
++    try {
++      const origin = (location && location.origin) || (typeof window !== "undefined" ? window.location.origin : "");
++      if (!origin || origin === "null") return null;
++      return safeURL(String(origin).replace(/\/$/, "") + "/#pt-proposal-" + encodeURIComponent(proposal.id));
++    } catch (_) {return null;}
++  }
+@@ -105 +154 @@
+-  const exported = {statuses, retainSnapshot, receiveSnapshot, readErrors, needsReview, isNew, topic, meetingTitle, calendarInfo, selectMeetings, collectionLabel, sourceRows, decisionSource, decisionPayload, checkpointLabel, parseLocation, safeURL};
++  const exported = {statuses, retainSnapshot, receiveSnapshot, readErrors, needsReview, isNew, topic, meetingTitle, calendarInfo, selectMeetings, collectionLabel, sourceRows, decisionSource, decisionPayload, deliveryPresentation, proposalSourceUrl, checkpointLabel, parseLocation, safeURL};
+@@ -115,0 +165 @@
++    if (!window.__PT_DIALOG_FOCUS__) window.__PT_DIALOG_FOCUS__ = {current: null};
+@@ -144 +194,5 @@
+-      function escape(event) {if (event.key === "Escape") {if (dialog) setDialog(null); else if (panel) route(tab, null);}}
++      function escape(event) {
++        if (event.key !== "Escape") return;
++        if (dialog) {setDialog(null); queueMicrotask(() => window.__PT_DIALOG_FOCUS__.current?.focus?.());}
++        else if (panel) route(tab, null);
++      }
+@@ -199,2 +253,9 @@
+-        await SDK.fetchJSON(base + "/proposals/" + encodeURIComponent(proposal.id) + "/decision", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(decisionPayload(proposal, action, note, fields, data?.tracker)), signal: AbortSignal.timeout(20000)});
+-        setDialog(null); setNotice(action === "accept" ? "Передача в Vikunja подтверждена. Связь с предложением сохранена." : action === "reject" ? "Отклонение сохранено." : "Уточнение сохранено. Личная задача не создана.");
++        const result = await SDK.fetchJSON(base + "/proposals/" + encodeURIComponent(proposal.id) + "/decision", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(decisionPayload(proposal, action, note, fields, data?.tracker)), signal: AbortSignal.timeout(20000)});
++        setDialog(null); queueMicrotask(() => window.__PT_DIALOG_FOCUS__.current?.focus?.());
++        if (action === "accept") {
++          const presentation = deliveryPresentation(result?.proposal || {});
++          if (presentation?.kind === "delivered") setNotice("Передано в Vikunja. Связь с предложением сохранена.");
++          else if (presentation?.kind === "accepted_pending") setNotice("Принято · передаём в Vikunja.");
++          else if (presentation?.kind === "unknown") setNotice("Принятие сохранено · результат передачи уточняется.");
++          else setNotice("Принятие сохранено. Проверьте состояние передачи после обновления.");
++        } else setNotice(action === "reject" ? "Отклонение сохранено." : "Уточнение сохранено. Личная задача не создана.");
+@@ -203,0 +265,23 @@
++    async function recoverTracker(proposal) {
++      if (disabled || writing.current) return;
++      const eventId = proposal?.tracker?.event_id;
++      if (!eventId) { setNotice("Нет идентификатора передачи для проверки."); return; }
++      writing.current = true; epoch.current++; setBusy(true); setNotice("");
++      try {
++        const result = await SDK.fetchJSON(base + "/proposals/" + encodeURIComponent(proposal.id) + "/tracker/recover", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({event_id: eventId}), signal: AbortSignal.timeout(20000)});
++        const recovered = result?.proposal || null;
++        // Install recover projection before refresh so a failed check cannot flash as delivered.
++        if (recovered && recovered.id) {
++          setData(previous => {
++            if (!previous || !Array.isArray(previous.proposals)) return previous;
++            return {...previous, proposals: previous.proposals.map(p => p.id === recovered.id ? {...p, ...recovered, tracker: recovered.tracker || p.tracker} : p)};
++          });
++        }
++        const presentation = deliveryPresentation(recovered || {});
++        if (presentation?.kind === "delivered") setNotice("Связь с задачей восстановлена.");
++        else if (presentation?.kind === "denied" || presentation?.kind === "unavailable") setNotice("Проверка доступа выполнена.");
++        else if (presentation?.kind === "unknown" || presentation?.kind === "conflict" || presentation?.kind === "lost_backlink") setNotice("Сверка выполнена · результат передачи уточняется.");
++        else setNotice("Проверка передачи выполнена.");
++      } catch (_) { setNotice("Не удалось проверить передачу. Обновите данные и повторите."); }
++      finally { writing.current = false; setBusy(false); refresh.current?.(); }
++    }
+@@ -231,3 +315,4 @@
+-        pending ? h("div", {className: "mt-actions mt-decision-actions"}, h("button", {disabled: disabled || !!proposal.stale, onClick: () => setDialog({type: data?.tracker?.ready ? "accept" : "tracker", proposal})}, "Добавить в мои задачи"),
+-          h("button", {disabled, onClick: () => setDialog({type: "decision", proposal, action: "reject"})}, "Отклонить…"),
+-          h("button", {disabled, onClick: () => setDialog({type: "decision", proposal, action: "clarify"})}, "Уточнить…")) : null,
++        pending ? h("div", {className: "mt-actions mt-decision-actions"}, h("button", {disabled: disabled || !!proposal.stale, onClick: event => {window.__PT_DIALOG_FOCUS__.current = event.currentTarget; setDialog({type: data?.tracker?.ready ? "accept" : "tracker", proposal, meetingTitle: meetingTitle(meeting), meetingTime: time.label, context: topic(meeting), sourceUrl: proposalSourceUrl(proposal, window.location)});}}, "Добавить в мои задачи"),
++          h("button", {disabled, onClick: event => {window.__PT_DIALOG_FOCUS__.current = event.currentTarget; setDialog({type: "decision", proposal, action: "reject", meetingTitle: meetingTitle(meeting), meetingTime: time.label, context: topic(meeting)});}}, "Отклонить…"),
++          h("button", {disabled, onClick: event => {window.__PT_DIALOG_FOCUS__.current = event.currentTarget; setDialog({type: "decision", proposal, action: "clarify", meetingTitle: meetingTitle(meeting), meetingTime: time.label, context: topic(meeting)});}}, "Уточнить…")) : null,
++        (() => {const delivery = deliveryPresentation(proposal); if (!delivery || delivery.kind === "legacy") return null; return h("div", {className: "mt-delivery", "data-delivery": delivery.kind}, h("p", {"aria-live": "polite"}, delivery.label), delivery.url ? h("p", null, h("a", {href: delivery.url, target: "_blank", rel: "noopener noreferrer"}, "Открыть задачу ↗")) : null, delivery.action === "reconcile" || delivery.action === "check_connection" ? h("button", {disabled: busy || !proposal?.tracker?.event_id, onClick: () => recoverTracker(proposal)}, delivery.action === "reconcile" ? "Проверить передачу" : "Проверить подключение") : null);})(),
+@@ -266 +351 @@
+-      h("header", {className: "mt-heading"}, h("div", null, h("p", {className: "mt-eyebrow"}, "Личный помощник"), h("h1", null, "Встречи"), h("p", {className: "mt-subtitle"}, "Саммари и предложения — в контексте обсуждения.")), h("div", {className: "mt-actions"}, safeURL(data?.tracker?.ui_url) ? h("a", {href: safeURL(data.tracker.ui_url), target: "_blank", rel: "noopener noreferrer"}, "Личные задачи ↗") : null, h("button", {onClick: () => refresh.current?.(), disabled: busy}, "Обновить"))),
++      h("header", {className: "mt-heading"}, h("div", null, h("p", {className: "mt-eyebrow"}, "Личный помощник"), h("h1", null, "Встречи"), h("p", {className: "mt-subtitle"}, "Саммари и предложения — в контексте обсуждения.")), h("div", {className: "mt-actions"}, safeURL(data?.tracker?.ui_url) ? h("a", {className: "mt-personal-tasks", href: safeURL(data.tracker.ui_url), target: "_blank", rel: "noopener noreferrer", "data-testid": "personal-tasks-link"}, "Личные задачи ↗") : null, h("button", {onClick: () => refresh.current?.(), disabled: busy}, "Обновить"))),
+@@ -298,5 +383,13 @@
+-    const accept = dialog.type === "accept";
+-    return h("div", {className: "mt-overlay mt-dialog-overlay"}, h("section", {className: "mt-confirm", role: "dialog", "aria-modal": true, "aria-label": dialog.type === "tracker" ? "Выбор личного трекера" : "Подтверждение решения"},
+-      h("h2", null, dialog.type === "tracker" ? "Подключение Vikunja ещё не завершено" : accept ? "Добавить личную задачу в Vikunja?" : dialog.action === "reject" ? "Отклонить предложение?" : "Сохранить запрос уточнения?"),
+-      h("p", null, dialog.proposal.text), dialog.type === "tracker" ? h(R.Fragment, null, h("p", null, "Личным трекером выбран Vikunja на Mini. Предложение сохранено; передача станет доступна после завершения локального подключения владельцем. Сейчас задача не создаётся, предложение не принимается."), tracker?.reason ? h("p", {className: "mt-meta"}, tracker.reason) : null, h("button", {onClick: close}, "Понятно")) : h("form", {onSubmit: event => {event.preventDefault(); save(dialog.proposal, accept ? "accept" : dialog.action, note, accept ? {title, due: due || null, due_confirmed: confirmed} : undefined);}},
+-        accept ? h(R.Fragment, null, h("label", null, "Название личной задачи", h("input", {value: title, required: true, maxLength: 500, onChange: event => setTitle(event.target.value)})),
++    const accept = dialog.type === "accept", firstField = R.useRef(null);
++    R.useEffect(() => {firstField.current?.focus?.();}, []);
++    function onClose() {close(); queueMicrotask(() => window.__PT_DIALOG_FOCUS__?.current?.focus?.());}
++    const wrapStyle = {overflowWrap: "anywhere", wordBreak: "break-word", maxWidth: "100%"};
++    return h("div", {className: "mt-overlay mt-dialog-overlay"}, h("section", {className: "mt-confirm", role: "dialog", "aria-modal": true, "aria-labelledby": "pt-decision-title", "aria-label": dialog.type === "tracker" ? "Выбор личного трекера" : "Подтверждение решения", style: wrapStyle},
++      h("h2", {id: "pt-decision-title", style: wrapStyle}, dialog.type === "tracker" ? "Подключение Vikunja ещё не завершено" : accept ? "Добавить личную задачу в Vikunja?" : dialog.action === "reject" ? "Отклонить предложение?" : "Сохранить запрос уточнения?"),
++      h("p", {className: "mt-wrap", style: wrapStyle, "data-testid": "pt-confirm-title"}, dialog.proposal.text),
++      dialog.meetingTitle ? h("p", {className: "mt-meta mt-wrap", style: wrapStyle, "data-testid": "pt-confirm-source"}, "Источник: ", dialog.meetingTitle, dialog.meetingTime ? " · " + dialog.meetingTime : "") : null,
++      dialog.context ? h("p", {className: "mt-context mt-wrap", style: wrapStyle, "data-testid": "pt-confirm-context"}, h("strong", null, "Обсуждали: "), dialog.context) : null,
++      safeURL(dialog.sourceUrl) ? h("p", null, h("a", {href: safeURL(dialog.sourceUrl), target: "_blank", rel: "noopener noreferrer"}, "Открыть предложение ↗")) : null,
++      dialog.proposal.due_hint ? h("p", {className: "mt-meta", style: wrapStyle}, "Срок из речи, не подтверждён: ", dialog.proposal.due_hint) : null,
++      dialog.type === "tracker" ? h(R.Fragment, null, h("p", null, "Личным трекером выбран Vikunja на Mini. Предложение сохранено; передача станет доступна после завершения локального подключения владельцем. Сейчас задача не создаётся, предложение не принимается."), tracker?.reason ? h("p", {className: "mt-meta"}, tracker.reason) : null, h("button", {ref: firstField, onClick: onClose}, "Понятно")) : h("form", {onSubmit: event => {event.preventDefault(); save(dialog.proposal, accept ? "accept" : dialog.action, note, accept ? {title, due: due || null, due_confirmed: confirmed} : undefined);}},
++        accept ? h(R.Fragment, null, h("label", null, "Название личной задачи", h("input", {ref: firstField, value: title, required: true, maxLength: 500, className: "mt-wrap", style: wrapStyle, onChange: event => setTitle(event.target.value)})),
+@@ -304,3 +397,3 @@
+-          h("label", {className: "mt-check"}, h("input", {type: "checkbox", checked: confirmed, onChange: event => setConfirmed(event.target.checked)}), due ? "Подтверждаю выбранный срок" : "Подтверждаю отсутствие срока")) : null,
+-        h("label", null, dialog.action === "clarify" ? "Что нужно уточнить" : "Комментарий к отклонению", h("textarea", {value: note, maxLength: 4000, onChange: event => setNote(event.target.value)})),
+-        h("p", {className: "mt-meta"}, accept ? "После подтверждения задача будет записана только в Vikunja со ссылкой на встречу и предложение. Исполнитель или модель не запускается." : "Решение относится к этой версии предложения. Личная задача не создаётся."), h("div", {className: "mt-actions"}, h("button", {type: "button", disabled, onClick: close}, "Отмена"), h("button", {type: "submit", disabled: disabled || (accept && (!tracker?.ready || !title.trim() || !confirmed))}, accept ? "Подтвердить добавление в Vikunja" : dialog.action === "reject" ? "Подтвердить отклонение" : "Сохранить уточнение")))));
++          h("label", {className: "mt-check"}, h("input", {type: "checkbox", checked: confirmed, onChange: event => setConfirmed(event.target.checked)}), due ? "Подтверждаю выбранный срок" : "Подтверждаю отсутствие срока"),
++          h("label", null, "Комментарий", h("textarea", {value: note, maxLength: 4000, onChange: event => setNote(event.target.value)}))) : h("label", null, dialog.action === "clarify" ? "Что нужно уточнить" : "Комментарий к отклонению", h("textarea", {ref: firstField, value: note, maxLength: 4000, onChange: event => setNote(event.target.value)})),
++        h("p", {className: "mt-meta"}, accept ? "После подтверждения задача будет записана только в Vikunja со ссылкой на встречу и предложение. Исполнитель или модель не запускается." : "Решение относится к этой версии предложения. Личная задача не создаётся."), h("div", {className: "mt-actions"}, h("button", {type: "button", disabled, onClick: onClose}, "Отмена"), h("button", {type: "submit", disabled: disabled || (accept && (!tracker?.ready || !title.trim() || !confirmed))}, accept ? "Принять и передать в Vikunja" : dialog.action === "reject" ? "Подтвердить отклонение" : "Сохранить уточнение")))));
+@@ -307,0 +401 @@
++

@@ -314,6 +314,72 @@ def bound_outbox_details(details: Mapping[str, Any], *, limit: int = 24) -> dict
     return out
 
 
+_OBSOLETE_UI_DIAGNOSTIC_REASONS = frozenset(
+    {"prepared_without_dispatch", "no_source_mapping"}
+)
+_OBSOLETE_UI_DIAGNOSTIC_KEYS = (
+    "cannot_first_deliver",
+    "ui_reconcile",
+    "forbid_create",
+    "receipt_preserved",
+)
+
+
+def stamp_verified_outbox_details(
+    details: Mapping[str, Any] | None,
+    *,
+    path: str,
+    checked_at: str | None = None,
+) -> dict[str, Any]:
+    """Clear stale no-first-HTTP diagnostics when delivery/link is verified (UX §4–5)."""
+    checked = checked_at or _utc_now()
+    cleaned = dict(details or {})
+    reason = cleaned.get("reason")
+    if isinstance(reason, str) and reason in _OBSOLETE_UI_DIAGNOSTIC_REASONS:
+        cleaned.pop("reason", None)
+    for key in _OBSOLETE_UI_DIAGNOSTIC_KEYS:
+        cleaned.pop(key, None)
+    cleaned["last_explicit_check"] = checked
+    cleaned["last_check_outcome"] = Outcome.CONFIRMED.value
+    cleaned["last_check_path"] = path
+    return cleaned
+
+
+def stamp_failed_check_outbox_details(
+    details: Mapping[str, Any] | None,
+    *,
+    outcome: Outcome | str,
+    path: str,
+    recovered_details: Mapping[str, Any] | None = None,
+    checked_at: str | None = None,
+) -> dict[str, Any]:
+    """Persist last_check_* so Core.snapshot keeps nonlinked recovery availability."""
+    checked = checked_at or _utc_now()
+    raw = outcome.value if isinstance(outcome, Outcome) else str(outcome)
+    merged = {
+        **dict(details or {}),
+        "api_outcome": raw,
+        "last_explicit_check": checked,
+        "last_check_outcome": raw,
+        "last_check_path": path,
+        **bound_outbox_details(recovered_details or {}),
+    }
+    reason = merged.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        merged["reason"] = reason.strip()[:120]
+    else:
+        src = (recovered_details or {}).get("reason")
+        if isinstance(src, str) and src.strip():
+            merged["reason"] = src.strip()[:120]
+        elif raw in {
+            Outcome.AUTH_DENIED.value,
+            Outcome.SCOPE_DENIED.value,
+            Outcome.DEPENDENCY_UNAVAILABLE.value,
+        }:
+            merged["reason"] = raw[:120]
+    return merged
+
+
 def tracker_availability_projection(
     *,
     outcome: Outcome | str | None = None,
@@ -338,7 +404,12 @@ def tracker_availability_projection(
         return None
     if raw == Outcome.CONFIRMED.value:
         return None
-    status = "conflict" if raw == Outcome.CONFLICT.value else "unavailable"
+    if raw == Outcome.CONFLICT.value:
+        status = "conflict"
+    elif raw in {Outcome.AUTH_DENIED.value, Outcome.SCOPE_DENIED.value}:
+        status = "denied"
+    else:
+        status = "unavailable"
     projection: dict[str, Any] = {
         "status": status,
         "outcome": raw[:64],
@@ -900,9 +971,28 @@ class HermesBridge:
         try:
             mapped = active.lookup_source(SOURCE_KIND, event_id)
             if mapped is None:
+                # Persist failed/no-mapping check so Core.snapshot() keeps availability
+                # after UI recover+refresh (FR-EA010-20/21/23, C5 0.3).
+                checked_at = _utc_now()
+
+                def mark_nomap(row: OutboxRecord) -> None:
+                    row.updated_at = checked_at
+                    row.details = {
+                        **row.details,
+                        "reason": "no_source_mapping",
+                        "last_explicit_check": checked_at,
+                        "last_check_outcome": Outcome.UNKNOWN.value,
+                        "last_check_path": path,
+                        "forbid_create": True,
+                        "receipt_preserved": True,
+                    }
+
+                updated = self._monotonic_outbox_apply(
+                    event_id, mark_nomap, allow_linked_fill=True
+                )
                 return DeliveryResult(
                     outcome=Outcome.UNKNOWN,
-                    record=record,
+                    record=updated or record,
                     details={
                         "path": path,
                         "reason": "no_source_mapping",
@@ -910,6 +1000,8 @@ class HermesBridge:
                         "receipt_preserved": True,
                         "historical_task_id": record.task_id,
                         "historical_url": record.url,
+                        "last_explicit_check": checked_at,
+                        "last_check_outcome": Outcome.UNKNOWN.value,
                     },
                 )
             client = self._client()
@@ -1016,12 +1108,9 @@ class HermesBridge:
 
                 def mark_verified(row: OutboxRecord) -> None:
                     row.updated_at = checked_at
-                    row.details = {
-                        **row.details,
-                        "last_explicit_check": checked_at,
-                        "last_check_outcome": Outcome.CONFIRMED.value,
-                        "last_check_path": path,
-                    }
+                    row.details = stamp_verified_outbox_details(
+                        row.details, path=path, checked_at=checked_at
+                    )
 
                 updated = self._monotonic_outbox_apply(
                     event_id, mark_verified, allow_linked_fill=True
@@ -1313,11 +1402,15 @@ class HermesBridge:
                         data["by_proposal"][current.proposal_id] = payload_row
                         data["by_event"][current.event_id] = payload_row
                         return
+                    checked_at = _utc_now()
                     current.task_id = task_id
                     current.url = url
                     current.state = OUTBOX_LINKED
                     current.operation_id = str(payload.get("operation_id") or current.operation_id)
-                    current.updated_at = _utc_now()
+                    current.updated_at = checked_at
+                    current.details = stamp_verified_outbox_details(
+                        current.details, path="deliver_link", checked_at=checked_at
+                    )
                     payload_row = current.to_payload()
                     data["by_proposal"][current.proposal_id] = payload_row
                     data["by_event"][current.event_id] = payload_row
@@ -1529,8 +1622,13 @@ class HermesBridge:
         finally:
             journal.close()
 
-    def recover(self, event_id: str) -> DeliveryResult:
-        """Recover one explicit outbox row. Never walks legacy Markdown accepts."""
+    def recover(self, event_id: str, *, allow_first_http: bool = True) -> DeliveryResult:
+        """Recover one explicit outbox row. Never walks legacy Markdown accepts.
+
+        allow_first_http=True preserves s06 first-deliver for missing mapping /
+        prepared_without_dispatch. UI reconcile (C5 0.3) passes False so those
+        paths only report unknown without PUT/create.
+        """
         event_id = validate_uuid_v4(event_id, label="event_id")
         try:
             record = self.outbox.get_by_event(event_id)
@@ -1583,10 +1681,14 @@ class HermesBridge:
                         data["by_proposal"][current.proposal_id] = payload_row
                         data["by_event"][current.event_id] = payload_row
                         return
+                    checked_at = _utc_now()
                     current.task_id = task_id
                     current.url = url
                     current.state = OUTBOX_LINKED
-                    current.updated_at = _utc_now()
+                    current.updated_at = checked_at
+                    current.details = stamp_verified_outbox_details(
+                        current.details, path="recover_link", checked_at=checked_at
+                    )
                     payload_row = current.to_payload()
                     data["by_proposal"][current.proposal_id] = payload_row
                     data["by_event"][current.event_id] = payload_row
@@ -1613,11 +1715,63 @@ class HermesBridge:
             if mapped is None:
                 # Acceptance survived but adapter never prepared — first deliver only.
                 if record.state in {OUTBOX_PENDING, OUTBOX_UNKNOWN} and record.task_id is None:
-                    return self.deliver(event_id)
+                    if allow_first_http:
+                        return self.deliver(event_id)
+                    checked_at = _utc_now()
+
+                    def mark_pending_nomap(row: OutboxRecord) -> None:
+                        row.updated_at = checked_at
+                        row.details = {
+                            **row.details,
+                            "reason": "no_source_mapping",
+                            "last_explicit_check": checked_at,
+                            "last_check_outcome": Outcome.UNKNOWN.value,
+                            "last_check_path": "recover_ui_nofirst",
+                            "forbid_create": True,
+                            "cannot_first_deliver": True,
+                            "ui_reconcile": True,
+                        }
+
+                    updated = self._monotonic_outbox_apply(
+                        event_id, mark_pending_nomap, allow_linked_fill=True
+                    )
+                    return DeliveryResult(
+                        outcome=Outcome.UNKNOWN,
+                        record=updated or record,
+                        details={
+                            "reason": "no_source_mapping",
+                            "forbid_create": True,
+                            "cannot_first_deliver": True,
+                            "ui_reconcile": True,
+                            "last_explicit_check": checked_at,
+                            "last_check_outcome": Outcome.UNKNOWN.value,
+                        },
+                    )
+                checked_at = _utc_now()
+
+                def mark_linked_nomap(row: OutboxRecord) -> None:
+                    row.updated_at = checked_at
+                    row.details = {
+                        **row.details,
+                        "reason": "no_source_mapping",
+                        "last_explicit_check": checked_at,
+                        "last_check_outcome": Outcome.UNKNOWN.value,
+                        "last_check_path": "recover",
+                        "forbid_create": True,
+                    }
+
+                updated = self._monotonic_outbox_apply(
+                    event_id, mark_linked_nomap, allow_linked_fill=True
+                )
                 return DeliveryResult(
                     outcome=Outcome.UNKNOWN,
-                    record=record,
-                    details={"reason": "no_source_mapping", "forbid_create": True},
+                    record=updated or record,
+                    details={
+                        "reason": "no_source_mapping",
+                        "forbid_create": True,
+                        "last_explicit_check": checked_at,
+                        "last_check_outcome": Outcome.UNKNOWN.value,
+                    },
                 )
             recovered = dispatcher.recover_create(mapped.issuer_id, mapped.operation_id)
             record = self.outbox.get_by_event(event_id) or record
@@ -1627,6 +1781,37 @@ class HermesBridge:
             ):
                 # Safe first HTTP was never claimed — resume with the original
                 # persisted envelope / operation ID (no new acceptance).
+                if not allow_first_http:
+                    checked_at = _utc_now()
+
+                    def mark_prepared(row: OutboxRecord) -> None:
+                        row.updated_at = checked_at
+                        row.details = {
+                            **row.details,
+                            "reason": "prepared_without_dispatch",
+                            "last_explicit_check": checked_at,
+                            "last_check_outcome": Outcome.UNKNOWN.value,
+                            "last_check_path": "recover_ui_nofirst",
+                            "forbid_create": True,
+                            "cannot_first_deliver": True,
+                            "ui_reconcile": True,
+                        }
+
+                    updated = self._monotonic_outbox_apply(
+                        event_id, mark_prepared, allow_linked_fill=True
+                    )
+                    return DeliveryResult(
+                        outcome=Outcome.UNKNOWN,
+                        record=updated or record,
+                        details={
+                            "reason": "prepared_without_dispatch",
+                            "forbid_create": True,
+                            "cannot_first_deliver": True,
+                            "ui_reconcile": True,
+                            "last_explicit_check": checked_at,
+                            "last_check_outcome": Outcome.UNKNOWN.value,
+                        },
+                    )
                 if record.operation_id is None:
 
                     def remember_mapped(current: OutboxRecord) -> None:
@@ -1656,6 +1841,18 @@ class HermesBridge:
                 )
                 if conflict is not None:
                     return conflict
+                checked_at = _utc_now()
+
+                def mark_recovered_ok(row: OutboxRecord) -> None:
+                    row.updated_at = checked_at
+                    row.details = stamp_verified_outbox_details(
+                        row.details, path="recover_create", checked_at=checked_at
+                    )
+
+                verified = self._monotonic_outbox_apply(
+                    event_id, mark_recovered_ok, allow_linked_fill=True
+                )
+                record = verified or self.outbox.get_by_event(event_id) or record
                 return DeliveryResult(
                     outcome=Outcome.CONFIRMED if record.state == OUTBOX_LINKED else Outcome.UNKNOWN,
                     record=record,
@@ -1663,16 +1860,19 @@ class HermesBridge:
                     details={"path": "recover_create", "create_http_attempts": recovered.create_http_attempts},
                 )
             if recovered.outcome is Outcome.CONFLICT:
+                checked_at = _utc_now()
 
                 def mark_conflict(current: OutboxRecord) -> None:
                     current.state = OUTBOX_CONFLICT
                     current.operation_id = mapped.operation_id
-                    current.updated_at = _utc_now()
-                    current.details = {
-                        **current.details,
-                        "api_outcome": recovered.outcome.value,
-                        **bound_outbox_details(recovered.details or {}),
-                    }
+                    current.updated_at = checked_at
+                    current.details = stamp_failed_check_outbox_details(
+                        current.details,
+                        outcome=recovered.outcome,
+                        path="recover_conflict",
+                        recovered_details=recovered.details,
+                        checked_at=checked_at,
+                    )
 
                 updated = self._monotonic_outbox_apply(event_id, mark_conflict)
                 return DeliveryResult(
@@ -1686,16 +1886,20 @@ class HermesBridge:
                     },
                 )
 
+            checked_at = _utc_now()
+
             def mark_unresolved(current: OutboxRecord) -> None:
                 if current.state not in {OUTBOX_LINKED, OUTBOX_CONFLICT}:
                     current.state = OUTBOX_UNKNOWN
                 current.operation_id = mapped.operation_id
-                current.updated_at = _utc_now()
-                current.details = {
-                    **current.details,
-                    "api_outcome": recovered.outcome.value,
-                    **bound_outbox_details(recovered.details or {}),
-                }
+                current.updated_at = checked_at
+                current.details = stamp_failed_check_outbox_details(
+                    current.details,
+                    outcome=recovered.outcome,
+                    path="recover_unresolved",
+                    recovered_details=recovered.details,
+                    checked_at=checked_at,
+                )
 
             updated = self._monotonic_outbox_apply(event_id, mark_unresolved, allow_linked_fill=True)
             return DeliveryResult(

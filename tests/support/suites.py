@@ -42,6 +42,12 @@ def _hermes_bridge_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[
     return run_hermes_bridge_suite(mode=mode, worktree=worktree, argv=argv)
 
 
+def _hermes_ux_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[str, Any]:
+    from .hermes_ux_suite import run_hermes_ux_suite
+
+    return run_hermes_ux_suite(mode=mode, worktree=worktree, argv=argv)
+
+
 def register_suite(name: str, runner: SuiteRunner) -> None:
     if not name or not str(name).strip():
         raise StandError("Suite name must be non-empty")
@@ -91,3 +97,4 @@ register_suite("journal", _journal_suite)
 register_suite("recovery", _recovery_suite)
 register_suite("mcp", _mcp_suite)
 register_suite("hermes-bridge", _hermes_bridge_suite)
+register_suite("hermes-ux", _hermes_ux_suite)

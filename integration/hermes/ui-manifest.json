@@ -1,0 +1,84 @@
+{
+  "baseline": {
+    "dist/index.js": {
+      "absolute": "/Users/efimovivan/Projects/cto-agent-environment/plugins/personal-tasks/dashboard/dist/index.js",
+      "sha256": "bb0144e8bcb343880a334b342f74cdcbdf08a5d8996e96d5442b503a77b822e8"
+    },
+    "ea_core.py": {
+      "absolute": "/Users/efimovivan/Projects/cto-agent-environment/scripts/ea_core.py",
+      "after_s06_sha256": "060a22948ac4154fbf2e5dd6c5699c2d887b32c7d312fd5f8ccc5982a7a11d49",
+      "sha256": "23deacba5cca06d314c5ec5717bbb3f6dd7f074974670324ab7f64baaecf10ef"
+    },
+    "plugin_api.py": {
+      "absolute": "/Users/efimovivan/Projects/cto-agent-environment/plugins/personal-tasks/dashboard/plugin_api.py",
+      "after_s06_sha256": "c200627f38b4cea8b5f979f8fa1394def53082d72fcde66f6be10d40a1ec8c77",
+      "s06_patch_sha256": "0eb9c821abae133f2f57d75d9c9c03c2d20c6585567d8c9120d9bfd26ea5f8a6",
+      "sha256": "938dc648daee8f5484a76de6bac0ed86f79b28463c89a1d17c6af02e833b0f51"
+    }
+  },
+  "browser": {
+    "chromium_revision": "1243",
+    "executablePath": "/Users/efimovivan/Library/Caches/ms-playwright/chromium_headless_shell-1243/chrome-headless-shell-mac-arm64/chrome-headless-shell",
+    "executable_sha256": "a0bfe7b4da4787b66058477d696cd1d09065d25f06a548947722b9af77ee8282",
+    "network_install": false,
+    "node": "v26.12.1",
+    "playwright": "1.62.1",
+    "playwright_module": "/Users/efimovivan/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright"
+  },
+  "c5_scope": {
+    "addendum_0_3": {
+      "path": "/Users/efimovivan/.local/state/cto-agent-environment/real-flows/rf-17bd4e51a4b66a1d1d902871/driver/s07-review/EA-010 C5 recovery addendum 0.3.md",
+      "revision": "0.3",
+      "sha256": "c9662c397c88aba6608800bcd44ff4c1de12a4d4b3596b41bd8cee4a814006f4"
+    },
+    "path": "/Users/efimovivan/.local/state/cto-agent-environment/real-flows/rf-17bd4e51a4b66a1d1d902871/driver/s07-review/EA-010 C5 UI scope 0.2.md",
+    "revision": "0.2+0.3",
+    "sha256": "6a975adb4c842b6c6cbb40a52b157eba577b038c5594503deab463e88a580eaf"
+  },
+  "mode": "isolated_synthetic_only",
+  "notes": [
+    "Synthetic-copy apply+rollback only; production apply/rollback not admitted by C5 0.2/0.3.",
+    "snapshot.tracker.ready probes EA010_HERMES_BRIDGE_CONFIG writer (api_origin/project_id/token); EA010_HERMES_UI_PROFILE supplies device browser_origin/timeout only.",
+    "Readiness uses http.client+_DeadlineSocket with one absolute monotonic deadline across connect/headers/body; no env proxy discovery, no redirect following; requires JSON array; invalid readiness config fails closed without 503.",
+    "C5 0.3 owner-approved: POST /proposals/{id}/tracker/recover with allow_first_http=False; missing mapping and prepared_without_dispatch report unknown without PUT; linked check/backlink repair admitted.",
+    "Bridge.recover default allow_first_http=True preserves s06 first-deliver for non-UI callers.",
+    "Playwright/Chromium pins are reused from the admitted C5 document without network install.",
+    "Readiness reuses BridgeConfig+VikunjaClient/_normalize_api_origin+TokenRef.load before any Authorization; failed UI recover stamps last_check into outbox so snapshot retains availability.",
+    "Successful deliver/recover link clears obsolete no-first diagnostics (last_check_outcome=confirmed); nonlinked recover persists last_check_outcome/last_explicit_check/reason for denied and dependency_unavailable through Core.snapshot."
+  ],
+  "patches": {
+    "ui": {
+      "allowed_original_ranges": [
+        "79-91",
+        "105",
+        "109-150",
+        "194-203",
+        "218-241",
+        "265-267",
+        "293-307"
+      ],
+      "diff_recipe": "diff -U0 --label a/plugins/personal-tasks/dashboard/dist/index.js --label b/plugins/personal-tasks/dashboard/dist/index.js",
+      "from_sha256": "bb0144e8bcb343880a334b342f74cdcbdf08a5d8996e96d5442b503a77b822e8",
+      "path": "integration/hermes/ui.patch",
+      "sha256": "f739edd8161415c048e04c6acddba75af141a0a8d846fa09a1ab2e166773e544",
+      "to_sha256": "6bacffae9924e6b2736c18ec13fc9774510c5d3d29705eac83af1967828ff023"
+    },
+    "ui_readiness": {
+      "applies_over": "integration/hermes/backend.patch",
+      "diff_recipe": "diff -U0 --label a/<path> --label b/<path> (plugin_api.py + ea_core.py)",
+      "from_sha256": "c200627f38b4cea8b5f979f8fa1394def53082d72fcde66f6be10d40a1ec8c77",
+      "path": "integration/hermes/ui-readiness.patch",
+      "regions": [
+        "snapshot readiness helpers + snapshot.tracker ready/ui_url",
+        "POST /proposals/{id}/tracker/recover (C5 0.3)",
+        "Core recover_vikunja_outbox allow_first_http + proposal_id projection"
+      ],
+      "sha256": "76cce043ebefae0a493bd81cd452897d23b3552c407b3e268ad578cf3545ee34",
+      "to_core_sha256": "58b2ea881752839c656fcfaa7c9043cfc07454750e45d83b2f127e553b103450",
+      "to_sha256": "123f1d6e03fd1b42321db9b2ded45bf2faaadf3ac3b388693814029692732a5d"
+    }
+  },
+  "production_apply": false,
+  "schema": "ea010-hermes-ui-manifest/v1",
+  "stage": "s07-hermes-ux"
+}
