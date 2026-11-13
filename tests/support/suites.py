@@ -60,6 +60,18 @@ def _restore_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[str, A
     return run_restore_suite(mode=mode, worktree=worktree, argv=argv)
 
 
+def _e2e_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[str, Any]:
+    from .e2e_suite import run_e2e_suite
+
+    return run_e2e_suite(mode=mode, worktree=worktree, argv=argv)
+
+
+def _all_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[str, Any]:
+    from .e2e_suite import run_all_suite
+
+    return run_all_suite(mode=mode, worktree=worktree, argv=argv)
+
+
 def register_suite(name: str, runner: SuiteRunner) -> None:
     if not name or not str(name).strip():
         raise StandError("Suite name must be non-empty")
@@ -112,3 +124,5 @@ register_suite("hermes-bridge", _hermes_bridge_suite)
 register_suite("hermes-ux", _hermes_ux_suite)
 register_suite("lifecycle", _lifecycle_suite)
 register_suite("restore", _restore_suite)
+register_suite("e2e", _e2e_suite)
+register_suite("all", _all_suite)

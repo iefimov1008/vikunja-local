@@ -419,7 +419,27 @@ def delete_owned_root_record(run_root: Path, raw: Any) -> Path:
 
 
 class StandError(RuntimeError):
-    """Fail-closed stand or cleanup error."""
+    """Fail-closed stand or cleanup error.
+
+    Optional ``child_rc`` / ``child_evidence`` / ``signal_receipt_path`` carry
+    structured reexec-child snapshots so aggregate ordinary failures can journal
+    run/IDs/cleanup without relying on process-local memory alone.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        child_rc: int | None = None,
+        child_evidence: dict[str, Any] | None = None,
+        signal_receipt_path: str | Path | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.child_rc = child_rc
+        self.child_evidence = dict(child_evidence) if isinstance(child_evidence, dict) else None
+        self.signal_receipt_path = (
+            str(signal_receipt_path) if signal_receipt_path is not None else None
+        )
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -1018,6 +1038,373 @@ class LimitWatchdog:
                 return
 
 
+# Aggregate/suite-all signal coordination: reexec component children and live
+# stand evidence must be reachable from the process-wide SIGTERM/SIGHUP path.
+# Reexec inners publish to process-local memory *and* a durable receipt path
+# outside the disposable stand so the parent can ingest evidence before it
+# redelivers the signal to itself.
+STAND_SIGNAL_RECEIPT_ENV = "EA010_STAND_SIGNAL_RECEIPT"
+STAND_SESSION_READY_ENV = "EA010_STAND_SESSION_READY"
+# Test/harness hook: after fixtures are written (and optional ready marker),
+# raise so reexec parents can exercise ordinary-failure evidence ingest.
+SYNTHETIC_FAIL_AFTER_SESSION_ENV = "EA010_SYNTHETIC_FAIL_AFTER_SESSION"
+_ACTIVE_COMPONENT_PROCS_LOCK = threading.RLock()
+_ACTIVE_COMPONENT_PROCS: list[subprocess.Popen[Any]] = []
+_ACTIVE_COMPONENT_RECEIPT_PATHS: dict[int, Path] = {}
+_ACTIVE_STANDS_LOCK = threading.RLock()
+_ACTIVE_STANDS: list["IsolatedStand"] = []
+_STAND_SIGNAL_EVIDENCE: dict[str, Any] | None = None
+
+
+def allocate_component_signal_receipt(profile: "StandProfile", *, suite: str) -> Path:
+    """Durable path under run_root (outside disposable stand dirs) for child evidence."""
+    safe_suite = re.sub(r"[^A-Za-z0-9._-]+", "_", suite) or "component"
+    root = profile.run_root / "journals" / "component-signal"
+    root.mkdir(mode=SAFE_DIR_MODE, parents=True, exist_ok=True)
+    os.chmod(root, SAFE_DIR_MODE)
+    return root / f"{safe_suite}-{os.getpid()}-{uuid.uuid4().hex[:16]}.json"
+
+
+def register_active_component_proc(
+    proc: subprocess.Popen[Any], *, signal_receipt_path: Path | None = None
+) -> None:
+    """Register a suite reexec/child process owned by the current aggregate."""
+    with _ACTIVE_COMPONENT_PROCS_LOCK:
+        if proc not in _ACTIVE_COMPONENT_PROCS:
+            _ACTIVE_COMPONENT_PROCS.append(proc)
+        if signal_receipt_path is not None:
+            _ACTIVE_COMPONENT_RECEIPT_PATHS[id(proc)] = Path(signal_receipt_path)
+
+
+def unregister_active_component_proc(proc: subprocess.Popen[Any]) -> None:
+    with _ACTIVE_COMPONENT_PROCS_LOCK:
+        try:
+            _ACTIVE_COMPONENT_PROCS.remove(proc)
+        except ValueError:
+            pass
+        _ACTIVE_COMPONENT_RECEIPT_PATHS.pop(id(proc), None)
+
+
+# Signals the aggregate cancels owned component children for. Blocked around
+# Popen+register so a handler cannot run in the acquisition window and miss
+# the newly spawned child.
+_COMPONENT_CANCEL_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+
+
+def _unblock_component_cancel_signals_in_child() -> None:
+    """Reset cancel-signal mask in the forked child before exec.
+
+    The parent blocks SIGTERM/SIGHUP around Popen+register; without this
+    reset the child would inherit the blocked mask and ignore later cancel.
+    """
+    if hasattr(signal, "pthread_sigmask"):
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, set(_COMPONENT_CANCEL_SIGNALS))
+
+
+def spawn_registered_component_proc(
+    popen_args: list[str],
+    *,
+    signal_receipt_path: Path | None = None,
+    **popen_kwargs: Any,
+) -> subprocess.Popen[Any]:
+    """Popen a component child and register it atomically vs cancel signals.
+
+    Blocks SIGTERM/SIGHUP for this thread across process creation and
+    registration so an aggregate handler cannot observe an empty registry,
+    redeliver, and orphan the newly spawned child. Pending cancel signals are
+    delivered only after registration completes. The child unblocks those
+    signals in ``preexec_fn`` so inherited mask cannot make it uncancellable.
+    """
+    blocked = set(_COMPONENT_CANCEL_SIGNALS)
+    mask_supported = hasattr(signal, "pthread_sigmask")
+    previous: set[int] | None = None
+    if mask_supported:
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+    proc: subprocess.Popen[Any] | None = None
+    try:
+        # Preserve a caller preexec_fn (if any) and always unblock cancel signals
+        # in the child so it does not inherit the parent's temporary block mask.
+        caller_preexec = popen_kwargs.pop("preexec_fn", None)
+
+        def _preexec() -> None:
+            _unblock_component_cancel_signals_in_child()
+            if caller_preexec is not None:
+                caller_preexec()
+
+        proc = subprocess.Popen(popen_args, preexec_fn=_preexec, **popen_kwargs)
+        register_active_component_proc(proc, signal_receipt_path=signal_receipt_path)
+        return proc
+    except Exception:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            unregister_active_component_proc(proc)
+        raise
+    finally:
+        if mask_supported and previous is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def _read_component_signal_receipt(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    try:
+        if not path.is_file():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — signal path must not raise
+        return {"error": f"{type(exc).__name__}: {exc}", "path": str(path)}
+    if isinstance(payload, dict):
+        return payload
+    return {"error": "signal receipt is not an object", "path": str(path)}
+
+
+def await_component_signal_receipt(
+    path: Path | None, *, timeout: float = 2.0
+) -> dict[str, Any] | None:
+    """Poll a durable reexec child receipt until usable evidence appears."""
+    if path is None:
+        return None
+    evidence: dict[str, Any] | None = None
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        evidence = _read_component_signal_receipt(path)
+        if evidence is not None and "error" not in evidence:
+            return evidence
+        if evidence is not None and evidence.get("run_id"):
+            return evidence
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    return evidence
+
+
+def cancel_active_component_procs(
+    signum: int, *, wait_timeout: float = 90.0
+) -> dict[str, Any]:
+    """Forward *signum* to registered component children and wait for exit.
+
+    Uses poll (not wait) so a concurrent ``communicate()`` in the parent suite
+    runner cannot deadlock the signal handler. Escalates to SIGKILL after timeout.
+    After the child exits, ingest any durable terminal snapshot written outside
+    the disposable stand so the aggregate can journal run/IDs/cleanup before
+    redelivering the signal to itself.
+    """
+    with _ACTIVE_COMPONENT_PROCS_LOCK:
+        procs = list(_ACTIVE_COMPONENT_PROCS)
+        receipt_paths = {id(proc): _ACTIVE_COMPONENT_RECEIPT_PATHS.get(id(proc)) for proc in procs}
+    details: list[dict[str, Any]] = []
+    for proc in procs:
+        receipt_path = receipt_paths.get(id(proc))
+        entry: dict[str, Any] = {
+            "pid": proc.pid,
+            "returncode_before": proc.poll(),
+            "signal_receipt_path": str(receipt_path) if receipt_path is not None else None,
+        }
+        if proc.poll() is None:
+            try:
+                os.kill(proc.pid, signum)
+                entry["signaled"] = int(signum)
+            except ProcessLookupError:
+                entry["signaled"] = False
+            deadline = time.monotonic() + wait_timeout
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if proc.poll() is None:
+                try:
+                    os.kill(proc.pid, signal.SIGKILL)
+                    entry["forced_kill"] = True
+                except ProcessLookupError:
+                    entry["forced_kill"] = False
+                kill_deadline = time.monotonic() + 5.0
+                while proc.poll() is None and time.monotonic() < kill_deadline:
+                    time.sleep(0.05)
+        entry["returncode"] = proc.poll()
+        entry["still_alive"] = proc.poll() is None
+        # Child may finish writing the receipt slightly after exit status appears.
+        evidence = await_component_signal_receipt(receipt_path, timeout=2.0)
+        if evidence is not None:
+            entry["signal_evidence"] = evidence
+        details.append(entry)
+        unregister_active_component_proc(proc)
+    return {"children": details, "signum": int(signum)}
+
+
+def register_active_stand(stand: "IsolatedStand") -> None:
+    with _ACTIVE_STANDS_LOCK:
+        if stand not in _ACTIVE_STANDS:
+            _ACTIVE_STANDS.append(stand)
+
+
+def unregister_active_stand(stand: "IsolatedStand") -> None:
+    with _ACTIVE_STANDS_LOCK:
+        try:
+            _ACTIVE_STANDS.remove(stand)
+        except ValueError:
+            pass
+
+
+def cleanup_active_stands_best_effort() -> list[dict[str, Any]]:
+    """Stop any in-process stands still registered with the current process."""
+    with _ACTIVE_STANDS_LOCK:
+        stands = list(_ACTIVE_STANDS)
+    results: list[dict[str, Any]] = []
+    for stand in stands:
+        if stand.cleaned:
+            results.append({"run_id": stand.run_id, "already_cleaned": True})
+            continue
+        try:
+            results.append(stand.cleanup())
+        except Exception as exc:  # noqa: BLE001 — best-effort signal path
+            results.append(
+                {
+                    "run_id": getattr(stand, "run_id", None),
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "cleaned": bool(getattr(stand, "cleaned", False)),
+                }
+            )
+    return results
+
+
+def publish_stand_signal_evidence(payload: dict[str, Any]) -> None:
+    """Retain live run/ID/cleanup evidence across SystemExit(128+signum).
+
+    Always keeps a process-local copy for in-process aggregate stands. When
+    ``EA010_STAND_SIGNAL_RECEIPT`` is set (reexec children), also persist the
+    snapshot outside the disposable stand so the parent can ingest it after
+    the child exits and before aggregate signal redelivery.
+    """
+    global _STAND_SIGNAL_EVIDENCE
+    snapshot = dict(payload)
+    _STAND_SIGNAL_EVIDENCE = snapshot
+    raw = (os.environ.get(STAND_SIGNAL_RECEIPT_ENV) or "").strip()
+    if not raw:
+        return
+    path = Path(raw).expanduser()
+    try:
+        if not path.is_absolute():
+            return
+        path.parent.mkdir(mode=SAFE_DIR_MODE, parents=True, exist_ok=True)
+        atomic_write_secure(
+            path,
+            json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
+            SAFE_FILE_MODE,
+        )
+    except Exception:
+        # Signal path must still exit with the original status.
+        pass
+
+
+def consume_stand_signal_evidence() -> dict[str, Any] | None:
+    global _STAND_SIGNAL_EVIDENCE
+    payload = _STAND_SIGNAL_EVIDENCE
+    _STAND_SIGNAL_EVIDENCE = None
+    return payload
+
+
+def peek_stand_signal_evidence() -> dict[str, Any] | None:
+    return dict(_STAND_SIGNAL_EVIDENCE) if _STAND_SIGNAL_EVIDENCE is not None else None
+
+
+def implementation_source_digest(worktree: Path) -> dict[str, Any]:
+    """Full candidate implementation revision/diff digest.
+
+    Includes every tracked modification and untracked implementation file under
+    the worktree. Accepted process/document inputs under ``docs/`` are excluded
+    by explicit policy (BR/ADR/NFR/UX/SR/plan/process markers are read-only
+    inputs, not implementation evidence).
+    """
+    root = Path(worktree)
+    head_proc = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    head = head_proc.stdout.strip() if head_proc.returncode == 0 else "unknown"
+    # Exclude docs/ from the tracked diff so accepted inputs do not bind digests.
+    diff = subprocess.run(
+        ["git", "diff", "HEAD", "--", ".", ":!docs/"],
+        cwd=root,
+        capture_output=True,
+        check=False,
+    )
+    untracked = subprocess.run(
+        ["git", "ls-files", "-o", "--exclude-standard"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    material = bytearray(diff.stdout or b"")
+    paths: list[str] = []
+    for rel in (untracked.stdout or "").splitlines():
+        if rel.startswith("docs/"):
+            continue
+        path = root / rel
+        if not path.is_file():
+            continue
+        paths.append(rel)
+        material.extend(rel.encode())
+        material.extend(b"\0")
+        material.extend(path.read_bytes())
+        material.extend(b"\0")
+    digest = sha256_bytes(bytes(material))
+    return {
+        "worktree": str(root),
+        "head": head,
+        "sha256": digest,
+        "diff_sha256": digest,
+        "untracked_implementation_files": paths,
+        "exclude_policy": "docs/** accepted process/document inputs",
+    }
+
+
+def cleanup_owned_manifests_under_run_root(
+    profile: "StandProfile", *, extra_manifest_paths: list[Path] | None = None
+) -> list[dict[str, Any]]:
+    """Best-effort identity-checked cleanup of leftover owned stand manifests."""
+    results: list[dict[str, Any]] = []
+    candidates: list[Path] = list(extra_manifest_paths or [])
+    try:
+        for child in sorted(profile.run_root.iterdir()):
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            if not RUN_ID_RE.match(child.name):
+                continue
+            manifest_path = child / "resource-manifest.json"
+            if manifest_path.is_file():
+                candidates.append(manifest_path)
+    except OSError:
+        pass
+    seen: set[str] = set()
+    for manifest_path in candidates:
+        key = str(manifest_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            manifest = load_manifest(manifest_path)
+            results.append(
+                {
+                    "manifest_path": key,
+                    "cleanup": cleanup_manifest(
+                        profile, manifest, manifest_path=manifest_path
+                    ),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 — signal-path best effort
+            results.append({"manifest_path": key, "error": f"{type(exc).__name__}: {exc}"})
+    return results
+
+
 @dataclass
 class IsolatedStand:
     profile: StandProfile
@@ -1305,51 +1692,9 @@ class IsolatedStand:
                 self._release_live_lock()
             raise
 
-    def _source_digest(self) -> dict[str, str]:
-        root = self.worktree or Path.cwd()
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        head = result.stdout.strip() if result.returncode == 0 else "unknown"
-        diff = subprocess.run(
-            ["git", "diff", "HEAD"],
-            cwd=root,
-            capture_output=True,
-            check=False,
-        )
-        # Include untracked candidate files so early-stage digests are non-empty
-        # before the coordinator helper commits the stage.
-        untracked = subprocess.run(
-            ["git", "ls-files", "-o", "--exclude-standard"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        material = bytearray(diff.stdout or b"")
-        paths = []
-        for rel in (untracked.stdout or "").splitlines():
-            path = root / rel
-            if not path.is_file():
-                continue
-            # Keep docs/process and accepted inputs out of the implementation digest.
-            if rel.startswith("docs/"):
-                continue
-            paths.append(rel)
-            material.extend(rel.encode())
-            material.extend(b"\0")
-            material.extend(path.read_bytes())
-            material.extend(b"\0")
-        return {
-            "worktree": str(root),
-            "head": head,
-            "diff_sha256": sha256_bytes(bytes(material)),
-            "untracked_implementation_files": paths,
-        }
+    def _source_digest(self) -> dict[str, Any]:
+        # Shared full-candidate digest (docs/ excluded by explicit policy).
+        return implementation_source_digest(self.worktree or Path.cwd())
 
     def start(self) -> None:
         if not self.manifest:
@@ -1982,6 +2327,29 @@ class IsolatedStand:
         self.manifest["status"] = "fixtures_ready"
         self._save_manifest()
         self._save_secrets()
+        ready_raw = (os.environ.get(STAND_SESSION_READY_ENV) or "").strip()
+        if ready_raw:
+            try:
+                ready_path = Path(ready_raw).expanduser()
+                if ready_path.is_absolute():
+                    ready_path.parent.mkdir(mode=SAFE_DIR_MODE, parents=True, exist_ok=True)
+                    atomic_write_secure(
+                        ready_path,
+                        json.dumps(
+                            {
+                                "run_id": self.run_id,
+                                "synthetic_ids": dict(self.synthetic_ids),
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        + "\n",
+                        SAFE_FILE_MODE,
+                    )
+            except Exception:
+                pass
+        if (os.environ.get(SYNTHETIC_FAIL_AFTER_SESSION_ENV) or "").strip() == "1":
+            raise RuntimeError("controlled failure after synthetic session")
         return dict(self.synthetic_ids)
 
     def revoke_token(self, handle: str = "api_token_primary") -> dict[str, Any]:
@@ -2269,11 +2637,38 @@ class IsolatedStand:
         self._release_live_lock()
         return result
 
+    def live_evidence_snapshot(self) -> dict[str, Any]:
+        """Capture run/resource/ID state before destructive signal teardown."""
+        return {
+            "run_id": self.run_id,
+            "synthetic_ids": dict(self.synthetic_ids),
+            "source": dict(self.manifest.get("source") or {})
+            if isinstance(self.manifest.get("source"), dict)
+            else self.manifest.get("source"),
+            "binary": dict(self.manifest.get("binary") or {})
+            if isinstance(self.manifest.get("binary"), dict)
+            else self.manifest.get("binary"),
+            "readiness": self.readiness,
+            "cleaned": self.cleaned,
+            "manifest_path": str(self.manifest_path) if self._created_run_dir else None,
+        }
+
     def install_signal_handlers(self) -> None:
         def _handler(signum: int, _frame: Any) -> None:
+            evidence = self.live_evidence_snapshot()
             try:
-                self.cleanup()
+                cleanup_result = self.cleanup()
+                evidence["cleanup"] = {
+                    "confirmed": bool(self.cleaned),
+                    **(cleanup_result if isinstance(cleanup_result, dict) else {}),
+                }
+            except Exception as exc:  # noqa: BLE001 — still exit with signal status
+                evidence["cleanup"] = {
+                    "confirmed": bool(self.cleaned),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
             finally:
+                publish_stand_signal_evidence(evidence)
                 raise SystemExit(128 + signum)
 
         for signum in (signal.SIGTERM, signal.SIGHUP):
@@ -2378,6 +2773,10 @@ class IsolatedStand:
             _record_secondary(exc)
         finally:
             try:
+                unregister_active_stand(self)
+            except BaseException as exc:
+                _record_secondary(exc)
+            try:
                 self.restore_signal_handlers()
             except BaseException as exc:
                 _record_secondary(exc)
@@ -2397,6 +2796,7 @@ class IsolatedStand:
 
     def __enter__(self) -> "IsolatedStand":
         self.secondary_cleanup_error = None
+        register_active_stand(self)
         self.install_signal_handlers()
         try:
             self.prepare()
@@ -2411,8 +2811,29 @@ class IsolatedStand:
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         try:
             if not self.cleaned:
-                self.cleanup()
+                if exc_type is not None:
+                    # Ordinary exceptional exits must publish the same structured
+                    # run/IDs/cleanup snapshot that signal handlers retain; otherwise
+                    # aggregate receipts lose live evidence after teardown deletes
+                    # the owned manifest/claim.
+                    evidence = self.live_evidence_snapshot()
+                    try:
+                        cleanup_result = self.cleanup()
+                        evidence["cleanup"] = {
+                            "confirmed": bool(self.cleaned),
+                            **(cleanup_result if isinstance(cleanup_result, dict) else {}),
+                        }
+                    except Exception as cleanup_exc:  # noqa: BLE001 — still surface primary
+                        evidence["cleanup"] = {
+                            "confirmed": bool(self.cleaned),
+                            "error": f"{type(cleanup_exc).__name__}: {cleanup_exc}",
+                        }
+                    finally:
+                        publish_stand_signal_evidence(evidence)
+                else:
+                    self.cleanup()
         finally:
+            unregister_active_stand(self)
             self.restore_signal_handlers()
             self._stop_watchdog()
             self._close_handshake()

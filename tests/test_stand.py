@@ -1303,11 +1303,14 @@ while True:
             get_suite(None)  # type: ignore[arg-type]
         with self.assertRaises(StandError):
             get_suite("no-such-suite")
-        # Registered verify suites across stages; retain unknown/empty negatives.
+        # Registered verify suites across stages (incl. s10 e2e/all);
+        # retain unknown/empty fail-closed negatives.
         self.assertEqual(
             list_suites(),
             [
+                "all",
                 "api",
+                "e2e",
                 "hermes-bridge",
                 "hermes-ux",
                 "journal",

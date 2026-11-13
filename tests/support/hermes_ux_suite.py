@@ -23,7 +23,17 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from .stand import IsolatedStand, StandError, load_profile, sha256_file
+from .stand import (
+    STAND_SIGNAL_RECEIPT_ENV,
+    IsolatedStand,
+    StandError,
+    allocate_component_signal_receipt,
+    await_component_signal_receipt,
+    load_profile,
+    sha256_file,
+    spawn_registered_component_proc,
+    unregister_active_component_proc,
+)
 
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
@@ -3359,11 +3369,18 @@ def run_hermes_ux_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[s
     if mode != "isolated":
         raise StandError(f"hermes-ux supports only isolated mode, got {mode!r}")
     if os.environ.get("EA010_HERMES_UX_INNER") != "1":
+        force_reexec = os.environ.get("EA010_FORCE_HERMES_REEXEC") == "1"
         try:
+            if force_reexec:
+                raise ImportError("EA010_FORCE_HERMES_REEXEC")
             import fastapi  # noqa: F401
             import uvicorn  # noqa: F401
         except ImportError:
             py = _hermes_python()
+            profile = load_profile()
+            # Durable receipt outside disposable stand: aggregate SIGTERM/SIGHUP
+            # redelivers before in-process memory from the child can be read.
+            signal_receipt = allocate_component_signal_receipt(profile, suite="hermes-ux")
             env = {
                 **os.environ,
                 "EA010_HERMES_UX_INNER": "1",
@@ -3373,7 +3390,9 @@ def run_hermes_ux_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[s
                     "EA010_ISOLATED_STAND_PROFILE",
                     "/Users/efimovivan/.ai-platform/work/ea010-stand/profile-v1.json",
                 ),
+                STAND_SIGNAL_RECEIPT_ENV: str(signal_receipt),
             }
+            env.pop("EA010_FORCE_HERMES_REEXEC", None)
             code = (
                 "import json,sys; from pathlib import Path; "
                 "from tests.support.hermes_ux_suite import run_hermes_ux_suite_inner; "
@@ -3381,22 +3400,56 @@ def run_hermes_ux_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[s
                 "argv=json.loads(sys.argv[3])); "
                 "print('EA010_HERMES_UX_RESULT:'+json.dumps(r, sort_keys=True))"
             )
-            proc = subprocess.run(
+            # Spawn+register under blocked SIGTERM/SIGHUP so aggregate cancel
+            # cannot miss this child between Popen acquisition and registration.
+            proc = spawn_registered_component_proc(
                 [py, "-c", code, mode, str(worktree), json.dumps(list(argv))],
-                capture_output=True,
+                signal_receipt_path=signal_receipt,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 env=env,
                 cwd=str(worktree),
             )
+            try:
+                stdout, stderr = proc.communicate()
+            finally:
+                unregister_active_component_proc(proc)
             if proc.returncode != 0:
+                # Ordinary nonzero exits must carry structured durable evidence
+                # (not only truncated receipt text) so suite-all can journal
+                # run/IDs/cleanup/raw child rc.
+                child_evidence = await_component_signal_receipt(signal_receipt, timeout=2.0)
+                if isinstance(child_evidence, dict) and child_evidence.get("error"):
+                    child_evidence = None
+                evidence_note = ""
+                if isinstance(child_evidence, dict):
+                    try:
+                        evidence_note = (
+                            "\nsignal_receipt="
+                            + json.dumps(child_evidence, sort_keys=True)[-2000:]
+                        )
+                    except Exception:
+                        evidence_note = f"\nsignal_receipt_path={signal_receipt}"
+                elif signal_receipt.is_file():
+                    evidence_note = f"\nsignal_receipt_path={signal_receipt}"
                 raise StandError(
                     "hermes-ux inner suite failed under Hermes python: "
-                    f"rc={proc.returncode}\nstdout={proc.stdout[-4000:]}\nstderr={proc.stderr[-4000:]}"
+                    f"rc={proc.returncode}\nstdout={(stdout or '')[-4000:]}\n"
+                    f"stderr={(stderr or '')[-4000:]}"
+                    f"{evidence_note}",
+                    child_rc=int(proc.returncode),
+                    child_evidence=child_evidence,
+                    signal_receipt_path=signal_receipt,
                 )
+            if signal_receipt.exists():
+                signal_receipt.unlink(missing_ok=True)
             marker = "EA010_HERMES_UX_RESULT:"
-            line = next((ln for ln in proc.stdout.splitlines() if ln.startswith(marker)), None)
+            line = next((ln for ln in (stdout or "").splitlines() if ln.startswith(marker)), None)
             if line is None:
-                raise StandError(f"inner suite produced no result marker; stdout={proc.stdout[-2000:]}")
+                raise StandError(
+                    f"inner suite produced no result marker; stdout={(stdout or '')[-2000:]}"
+                )
             result = json.loads(line[len(marker) :])
             result["hermes_python"] = py
             result["reexec"] = True
