@@ -275,6 +275,156 @@ class DispatchCriticalSection:
         )
 
 
+@dataclass
+class RestoreRecoverySection:
+    """Serialized restore reconcile generation: fence through publish under one OS-lock.
+
+    Holds the canonical OS-lock for the whole interval (inventory validation,
+    pending recovery, and publication). mark_unknown / record_receipt /
+    mark_conflict may commit while restore_drift stays set and writes_enabled
+    stays 0, so process death mid-recovery cannot rearm first HTTP.
+    publish_writes() alone clears the fence, and only when the durable
+    restore_reconcile_generation still matches the generation claimed at
+    section entry — a newer failure/fence cannot be erased by a stale success.
+    """
+
+    _journal: "IntegrationJournal"
+    claimed_generation: str | None = None
+
+    @property
+    def os_lock_held(self) -> bool:
+        return self._journal._store.lock.held
+
+    def list_operations(self) -> list[OperationRecord]:
+        return self._journal.list_operations()
+
+    def get_operation(self, issuer_id: str, operation_id: str) -> OperationRecord | None:
+        return self._journal.get_operation(issuer_id, operation_id)
+
+    def record_receipt(
+        self,
+        issuer_id: str,
+        operation_id: str,
+        *,
+        vikunja_id: int,
+        project_id: int,
+        marker: str | None,
+        effect: Mapping[str, Any],
+        witnessed_at: str | None = None,
+    ) -> OperationRecord:
+        return self._journal.record_receipt(
+            issuer_id,
+            operation_id,
+            vikunja_id=vikunja_id,
+            project_id=project_id,
+            marker=marker,
+            effect=effect,
+            witnessed_at=witnessed_at,
+        )
+
+    def mark_unknown(
+        self,
+        issuer_id: str,
+        operation_id: str,
+        *,
+        reason: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> OperationRecord:
+        return self._journal.mark_unknown(
+            issuer_id,
+            operation_id,
+            reason=reason,
+            details=details,
+        )
+
+    def mark_conflict(
+        self,
+        issuer_id: str,
+        operation_id: str,
+        *,
+        reason: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> OperationRecord:
+        return self._journal.mark_conflict(
+            issuer_id,
+            operation_id,
+            reason=reason,
+            details=details,
+        )
+
+    def publish_writes(self) -> None:
+        """Clear restore_drift only for this section's claimed reconcile generation."""
+        if not self._journal._restore_recovery_active:
+            raise JournalError(
+                Outcome.VALIDATION_ERROR,
+                "publish_writes requires an active restore recovery section",
+            )
+        if self.claimed_generation is None:
+            raise JournalError(
+                Outcome.VALIDATION_ERROR,
+                "publish_writes requires a claimed restore reconcile generation",
+            )
+        if self._journal._get_meta("quarantine") == "1":
+            raise JournalError(
+                Outcome.DEPENDENCY_UNAVAILABLE,
+                "journal is quarantined; writes refused",
+                storage_kind="corrupt",
+            )
+        current = self._journal._get_meta("restore_reconcile_generation")
+        if current != self.claimed_generation:
+            raise JournalError(
+                Outcome.CONFLICT,
+                "stale restore reconcile generation; writes remain closed",
+                details={
+                    "claimed_generation": self.claimed_generation,
+                    "durable_generation": current,
+                },
+            )
+        try:
+            with self._journal._store.transaction():
+                # Re-check under the write transaction so a concurrent fence bump
+                # cannot lose to an older successful publisher.
+                durable = self._journal._get_meta("restore_reconcile_generation")
+                if durable != self.claimed_generation:
+                    raise JournalError(
+                        Outcome.CONFLICT,
+                        "stale restore reconcile generation; writes remain closed",
+                        details={
+                            "claimed_generation": self.claimed_generation,
+                            "durable_generation": durable,
+                        },
+                    )
+                next_gen = str(int(self.claimed_generation) + 1)
+                self._journal._store.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("restore_drift", "0"),
+                )
+                self._journal._store.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("writes_enabled", "1"),
+                )
+                self._journal._store.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("restore_reconcile_generation", next_gen),
+                )
+                self._journal._append_history(
+                    "",
+                    "",
+                    "restore_writes_published",
+                    {
+                        "restore_drift": "0",
+                        "writes_enabled": "1",
+                        "reconcile_generation": self.claimed_generation,
+                        "next_generation": next_gen,
+                    },
+                )
+        except StorageError as exc:
+            raise _map_storage(exc) from exc
+
+
 class IntegrationJournal:
     """SQLite journal for one Mini adapter installation."""
 
@@ -289,6 +439,8 @@ class IntegrationJournal:
             raise _map_storage(exc) from exc
         # Always expose the canonical path bound to the OS-lock.
         self.path = self._store.path
+        # True only while restore_recovery_section holds the OS-lock.
+        self._restore_recovery_active = False
 
     @property
     def sqlite_user_version(self) -> int:
@@ -342,6 +494,32 @@ class IntegrationJournal:
                 # Lock release is owned by _mutation_guard.__exit__; section is
                 # invalid after the context ends.
                 pass
+
+    @contextmanager
+    def restore_recovery_section(self) -> Iterator[RestoreRecoverySection]:
+        """Serialize a full restore reconcile generation under the canonical OS-lock.
+
+        On enter: fence writes and claim restore_reconcile_generation. Inventory
+        validation, recovery mutations, and publish_writes all run while the lock
+        remains held. can_dispatch and new intents stay refused until
+        publish_writes() clears the fence for this claimed generation. Process
+        death mid-section therefore cannot leave prepared intents rearmed, and a
+        stale success cannot erase a newer failure generation.
+        """
+        if self._restore_recovery_active:
+            raise JournalError(
+                Outcome.VALIDATION_ERROR,
+                "nested restore recovery section is not allowed",
+            )
+        with self._mutation_guard(require_writable=False):
+            self._restore_recovery_active = True
+            section = RestoreRecoverySection(self)
+            try:
+                # Fence + claim under the already-held OS-lock (no short unlock).
+                section.claimed_generation = self._fence_restore_reconcile_unlocked()
+                yield section
+            finally:
+                self._restore_recovery_active = False
 
     def ensure_issuer(self, issuer_id: str | None = None) -> str:
         """Load durable issuer or mint once on a genuinely empty install.
@@ -682,7 +860,7 @@ class IntegrationJournal:
         effect_json = _canonical_payload(effect)
         witnessed = witnessed_at or _utc_now()
         now = _utc_now()
-        with self._mutation_guard():
+        with self._mutation_guard(allow_restore_recovery=True):
             record = self._load_operation(issuer_id, operation_id)
             if record is None:
                 raise JournalError(Outcome.VALIDATION_ERROR, "operation not found")
@@ -801,7 +979,7 @@ class IntegrationJournal:
         issuer_id = validate_uuid_v4(issuer_id, label="issuer_id")
         operation_id = validate_uuid_v4(operation_id, label="operation_id")
         now = _utc_now()
-        with self._mutation_guard():
+        with self._mutation_guard(allow_restore_recovery=True):
             record = self._load_operation(issuer_id, operation_id)
             if record is None:
                 raise JournalError(Outcome.VALIDATION_ERROR, "operation not found")
@@ -846,7 +1024,7 @@ class IntegrationJournal:
         issuer_id = validate_uuid_v4(issuer_id, label="issuer_id")
         operation_id = validate_uuid_v4(operation_id, label="operation_id")
         now = _utc_now()
-        with self._mutation_guard():
+        with self._mutation_guard(allow_restore_recovery=True):
             record = self._load_operation(issuer_id, operation_id)
             if record is None:
                 raise JournalError(Outcome.VALIDATION_ERROR, "operation not found")
@@ -940,6 +1118,9 @@ class IntegrationJournal:
                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                             ("writes_enabled", "0"),
                         )
+                        # Bump generation so an in-flight older reconcile cannot
+                        # publish_writes over this newer failure/fence.
+                        self._bump_restore_reconcile_generation_unlocked()
                     elif self._get_meta("quarantine") != "1":
                         self._store.execute(
                             "INSERT INTO meta(key, value) VALUES(?, ?) "
@@ -948,6 +1129,67 @@ class IntegrationJournal:
                         )
             except StorageError as exc:
                 raise _map_storage(exc) from exc
+
+    def _restore_reconcile_generation_value(self) -> int:
+        raw = self._get_meta("restore_reconcile_generation")
+        if raw is None or raw == "":
+            return 0
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise JournalError(
+                Outcome.DEPENDENCY_UNAVAILABLE,
+                "restore_reconcile_generation is not an integer",
+                storage_kind="corrupt",
+                details={"value": raw},
+            ) from exc
+        if value < 0:
+            raise JournalError(
+                Outcome.DEPENDENCY_UNAVAILABLE,
+                "restore_reconcile_generation must be non-negative",
+                storage_kind="corrupt",
+                details={"value": raw},
+            )
+        return value
+
+    def _bump_restore_reconcile_generation_unlocked(self) -> str:
+        """Increment durable reconcile generation; caller must hold OS-lock/txn."""
+        nxt = str(self._restore_reconcile_generation_value() + 1)
+        self._store.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("restore_reconcile_generation", nxt),
+        )
+        return nxt
+
+    def _fence_restore_reconcile_unlocked(self) -> str:
+        """Fence writes and claim the next reconcile generation under the OS-lock."""
+        try:
+            with self._store.transaction():
+                self._store.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("restore_drift", "1"),
+                )
+                self._store.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("writes_enabled", "0"),
+                )
+                claimed = self._bump_restore_reconcile_generation_unlocked()
+                self._append_history(
+                    "",
+                    "",
+                    "restore_reconcile_fenced",
+                    {
+                        "restore_drift": "1",
+                        "writes_enabled": "0",
+                        "reconcile_generation": claimed,
+                    },
+                )
+                return claimed
+        except StorageError as exc:
+            raise _map_storage(exc) from exc
 
     def quarantine(self) -> None:
         """Mark journal quarantined after corruption suspicion; refuse writes."""
@@ -1184,10 +1426,23 @@ class IntegrationJournal:
             storage_kind="corrupt",
         )
 
-    def _mutation_guard(self, *, require_writable: bool = True):
+    def _mutation_guard(
+        self,
+        *,
+        require_writable: bool = True,
+        allow_restore_recovery: bool = False,
+    ):
         class _Guard:
-            def __init__(self, journal: "IntegrationJournal"):
+            def __init__(
+                self,
+                journal: "IntegrationJournal",
+                *,
+                require_writable: bool,
+                allow_restore_recovery: bool,
+            ):
                 self.journal = journal
+                self.require_writable = require_writable
+                self.allow_restore_recovery = allow_restore_recovery
                 self._acquired = False
 
             def __enter__(self):
@@ -1202,8 +1457,14 @@ class IntegrationJournal:
                     # for every mutation (including ensure_issuer), including when the
                     # SQLite connection was already open before an in-place restore.
                     self.journal._store.revalidate_live_connection()
-                    if require_writable:
-                        self.journal._require_writable()
+                    if self.require_writable:
+                        if (
+                            self.allow_restore_recovery
+                            and self.journal._restore_recovery_active
+                        ):
+                            self.journal._require_restore_recovery_writable()
+                        else:
+                            self.journal._require_writable()
                     return self
                 except StorageError as exc:
                     if self._acquired:
@@ -1223,7 +1484,11 @@ class IntegrationJournal:
                     self.journal._store.lock.release()
                     self._acquired = False
 
-        return _Guard(self)
+        return _Guard(
+            self,
+            require_writable=require_writable,
+            allow_restore_recovery=allow_restore_recovery,
+        )
 
     def _require_open_readable(self) -> None:
         try:
@@ -1313,6 +1578,67 @@ class IntegrationJournal:
     def _require_writable(self) -> None:
         self._require_open_readable()
         self._assert_write_flags()
+        if self._get_meta("issuer_id") is None:
+            if self._has_prior_durable_identity():
+                raise JournalError(
+                    Outcome.DEPENDENCY_UNAVAILABLE,
+                    "durable issuer lost; writes refused until reconcile",
+                    storage_kind="unavailable",
+                    details={"prior_durable_identity": True},
+                )
+            raise JournalError(
+                Outcome.DEPENDENCY_UNAVAILABLE,
+                "issuer_id missing from durable journal",
+                storage_kind="unavailable",
+            )
+
+    def _require_restore_recovery_writable(self) -> None:
+        """Permit recovery mutations while restore_drift keeps first HTTP closed.
+
+        Quarantine and missing issuer still refuse. writes_enabled may stay 0 so
+        can_dispatch / prepare_intent / begin_dispatch remain fail-closed for
+        concurrent writers and process-death mid-recovery.
+        """
+        self._require_open_readable()
+        allowed = frozenset({"0", "1"})
+        quarantine = self._get_meta("quarantine")
+        restore_drift = self._get_meta("restore_drift")
+        writes_enabled = self._get_meta("writes_enabled")
+        missing = [
+            key
+            for key, value in (
+                ("quarantine", quarantine),
+                ("restore_drift", restore_drift),
+                ("writes_enabled", writes_enabled),
+            )
+            if value is None
+        ]
+        invalid = {
+            key: value
+            for key, value in (
+                ("quarantine", quarantine),
+                ("restore_drift", restore_drift),
+                ("writes_enabled", writes_enabled),
+            )
+            if value is not None and value not in allowed
+        }
+        if missing or invalid:
+            raise JournalError(
+                Outcome.DEPENDENCY_UNAVAILABLE,
+                "journal safety metadata missing or invalid; writes refused until reconcile",
+                storage_kind="corrupt",
+                details={
+                    "missing_safety_meta": missing,
+                    "invalid_safety_meta": invalid,
+                    "partial_copy": True,
+                },
+            )
+        if quarantine == "1":
+            raise JournalError(
+                Outcome.DEPENDENCY_UNAVAILABLE,
+                "journal is quarantined; writes refused",
+                storage_kind="corrupt",
+            )
         if self._get_meta("issuer_id") is None:
             if self._has_prior_durable_identity():
                 raise JournalError(

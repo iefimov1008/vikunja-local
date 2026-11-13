@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
@@ -25,9 +26,11 @@ if str(ROOT) not in sys.path:
 from tests.support.stand import (  # noqa: E402
     MANIFEST_SCHEMA,
     IsolatedStand,
+    LimitWatchdog,
     StandError,
     _stop_manifest_process,
     assert_immediate_run_child,
+    assert_owned_root_under_run_root,
     assert_ports_free,
     assert_suite_result_contract,
     bind_manifest_paths,
@@ -36,15 +39,18 @@ from tests.support.stand import (  # noqa: E402
     listeners,
     load_ownership_claim,
     load_profile,
+    owned_root_path,
     ownership_claim_path,
     process_matches_identity,
     process_start_identity,
+    process_tree_rss_bytes,
     run_stand_cycle,
     sha256_file,
     validate_journal_path,
     verify_binary,
     write_secure,
 )
+import tests.support.stand as stand_mod  # noqa: E402
 from tests.support.suites import SUITE_REGISTRY, get_suite, list_suites, register_suite  # noqa: E402
 
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
@@ -674,6 +680,234 @@ class StandUnitTests(unittest.TestCase):
         self.assertFalse(run_dir.exists())
         self.assertEqual(listeners(self.profile.vikunja_port), set())
 
+    def test_owned_root_symlink_substitution_refuses_cleanup_deletion(self):
+        """P1/NFR-18: rename+symlink to a foreign sibling must not rmtree the foreign tree."""
+        stand = IsolatedStand(profile=self.profile, worktree=self.worktree)
+        stand.prepare()
+        owned = stand.claim_owned_root(prefix="EA010-SYNTHETIC-owned-")
+        owned_marker = owned / "OWNED-MARKER"
+        owned_marker.write_text("EA010-SYNTHETIC-owned\n", encoding="utf-8")
+        renamed = owned.parent / f"{owned.name}-renamed"
+        owned.rename(renamed)
+        foreign = Path(
+            tempfile.mkdtemp(
+                prefix="EA010-SYNTHETIC-foreign-",
+                dir=str(self.profile.run_root),
+            )
+        )
+        foreign_marker = foreign / "FOREIGN-MARKER"
+        foreign_marker.write_text("EA010-SYNTHETIC-foreign\n", encoding="utf-8")
+        Path(owned).symlink_to(foreign, target_is_directory=True)
+        with self.assertRaises(StandError) as assert_ctx:
+            assert_owned_root_under_run_root(self.profile.run_root, Path(str(owned)))
+        self.assertIn("symlink substitution", str(assert_ctx.exception).lower())
+        with self.assertRaises(StandError) as cleanup_ctx:
+            stand.cleanup(revoke=False)
+        self.assertIn("recovery state retained", str(cleanup_ctx.exception).lower())
+        self.assertTrue(foreign_marker.is_file())
+        self.assertEqual(
+            foreign_marker.read_text(encoding="utf-8"),
+            "EA010-SYNTHETIC-foreign\n",
+        )
+        self.assertTrue(renamed.is_dir())
+        self.assertTrue((renamed / "OWNED-MARKER").is_file())
+        self.assertTrue(Path(str(owned)).is_symlink())
+        # Finish via cleanup_manifest on a repaired claim: restore real directory identity.
+        Path(str(owned)).unlink()
+        renamed.rename(owned)
+        shutil.rmtree(foreign)
+        result = stand.cleanup(revoke=False)
+        self.assertTrue(result["directory_removed"])
+        self.assertFalse(owned.exists())
+        self.assertFalse(foreign.exists())
+
+    def test_owned_root_symlink_substitution_refuses_cleanup_manifest(self):
+        """P1/NFR-18: cleanup_manifest must fail closed on the same symlink identity swap."""
+        stand = IsolatedStand(profile=self.profile, worktree=self.worktree)
+        stand.prepare()
+        owned = stand.claim_owned_root(prefix="EA010-SYNTHETIC-owned-mf-")
+        (owned / "OWNED-MARKER").write_text("EA010-SYNTHETIC-owned-mf\n", encoding="utf-8")
+        manifest = json.loads(stand.manifest_path.read_text(encoding="utf-8"))
+        manifest_path = stand.manifest_path
+        run_dir = stand.run_dir
+        # Detach in-memory stand without deleting so cleanup_manifest owns recovery.
+        stand._release_live_lock()
+        stand.cleaned = True
+        renamed = owned.parent / f"{owned.name}-renamed"
+        owned.rename(renamed)
+        foreign = Path(
+            tempfile.mkdtemp(
+                prefix="EA010-SYNTHETIC-foreign-mf-",
+                dir=str(self.profile.run_root),
+            )
+        )
+        (foreign / "FOREIGN-MARKER").write_text("EA010-SYNTHETIC-foreign-mf\n", encoding="utf-8")
+        Path(owned).symlink_to(foreign, target_is_directory=True)
+        with self.assertRaises(StandError) as ctx:
+            cleanup_manifest(self.profile, manifest, manifest_path=manifest_path)
+        self.assertIn("recovery state retained", str(ctx.exception).lower())
+        self.assertTrue((foreign / "FOREIGN-MARKER").is_file())
+        self.assertTrue((renamed / "OWNED-MARKER").is_file())
+        self.assertTrue(Path(str(owned)).is_symlink())
+        Path(str(owned)).unlink()
+        renamed.rename(owned)
+        shutil.rmtree(foreign)
+        repaired = json.loads(manifest_path.read_text(encoding="utf-8"))
+        result = cleanup_manifest(self.profile, repaired, manifest_path=manifest_path)
+        self.assertTrue(result["directory_removed"])
+        self.assertFalse(run_dir.exists())
+
+    def test_owned_root_directory_substitution_refuses_cleanup_deletion(self):
+        """P1/NFR-18: rename+mkdir replacement must not rmtree the foreign tree."""
+        stand = IsolatedStand(profile=self.profile, worktree=self.worktree)
+        stand.prepare()
+        owned = stand.claim_owned_root(prefix="EA010-SYNTHETIC-owned-dir-")
+        record = (stand.manifest.get("owned_roots") or [])[-1]
+        self.assertEqual(owned_root_path(record), owned)
+        self.assertIn("st_dev", record)
+        self.assertIn("st_ino", record)
+        (owned / "OWNED-MARKER").write_text("EA010-SYNTHETIC-owned-dir\n", encoding="utf-8")
+        renamed = owned.parent / f"{owned.name}-renamed"
+        owned.rename(renamed)
+        owned.mkdir()
+        (owned / "FOREIGN-MARKER").write_text("EA010-SYNTHETIC-foreign-dir\n", encoding="utf-8")
+        with self.assertRaises(StandError) as cleanup_ctx:
+            stand.cleanup(revoke=False)
+        self.assertIn("recovery state retained", str(cleanup_ctx.exception).lower())
+        self.assertTrue((owned / "FOREIGN-MARKER").is_file())
+        self.assertEqual(
+            (owned / "FOREIGN-MARKER").read_text(encoding="utf-8"),
+            "EA010-SYNTHETIC-foreign-dir\n",
+        )
+        self.assertTrue((renamed / "OWNED-MARKER").is_file())
+        shutil.rmtree(owned)
+        renamed.rename(owned)
+        result = stand.cleanup(revoke=False)
+        self.assertTrue(result["directory_removed"])
+        self.assertFalse(owned.exists())
+
+    def test_owned_root_directory_substitution_refuses_cleanup_manifest(self):
+        """P1/NFR-18: cleanup_manifest must refuse ordinary-directory replacement."""
+        stand = IsolatedStand(profile=self.profile, worktree=self.worktree)
+        stand.prepare()
+        owned = stand.claim_owned_root(prefix="EA010-SYNTHETIC-owned-dir-mf-")
+        (owned / "OWNED-MARKER").write_text("EA010-SYNTHETIC-owned-dir-mf\n", encoding="utf-8")
+        manifest = json.loads(stand.manifest_path.read_text(encoding="utf-8"))
+        manifest_path = stand.manifest_path
+        run_dir = stand.run_dir
+        stand._release_live_lock()
+        stand.cleaned = True
+        renamed = owned.parent / f"{owned.name}-renamed"
+        owned.rename(renamed)
+        owned.mkdir()
+        (owned / "FOREIGN-MARKER").write_text("EA010-SYNTHETIC-foreign-dir-mf\n", encoding="utf-8")
+        with self.assertRaises(StandError) as ctx:
+            cleanup_manifest(self.profile, manifest, manifest_path=manifest_path)
+        self.assertIn("recovery state retained", str(ctx.exception).lower())
+        self.assertTrue((owned / "FOREIGN-MARKER").is_file())
+        self.assertTrue((renamed / "OWNED-MARKER").is_file())
+        shutil.rmtree(owned)
+        renamed.rename(owned)
+        repaired = json.loads(manifest_path.read_text(encoding="utf-8"))
+        result = cleanup_manifest(self.profile, repaired, manifest_path=manifest_path)
+        self.assertTrue(result["directory_removed"])
+        self.assertFalse(run_dir.exists())
+
+    def test_owned_root_delete_time_race_refuses_foreign_deletion(self):
+        """P1/NFR-18: swap after identity bind must not delete the foreign replacement."""
+        stand = IsolatedStand(profile=self.profile, worktree=self.worktree)
+        stand.prepare()
+        owned = stand.claim_owned_root(prefix="EA010-SYNTHETIC-owned-race-")
+        (owned / "OWNED-MARKER").write_text("EA010-SYNTHETIC-owned-race\n", encoding="utf-8")
+        renamed = owned.parent / f"{owned.name}-renamed"
+        foreign_marker_text = "EA010-SYNTHETIC-foreign-race\n"
+
+        def _swap_after_bind(path: Path) -> None:
+            if path != owned:
+                return
+            path.rename(renamed)
+            path.mkdir()
+            (path / "FOREIGN-MARKER").write_text(foreign_marker_text, encoding="utf-8")
+
+        previous = stand_mod._test_owned_root_pre_delete_hook
+        stand_mod._test_owned_root_pre_delete_hook = _swap_after_bind
+        try:
+            with self.assertRaises(StandError) as cleanup_ctx:
+                stand.cleanup(revoke=False)
+        finally:
+            stand_mod._test_owned_root_pre_delete_hook = previous
+        self.assertIn("recovery state retained", str(cleanup_ctx.exception).lower())
+        self.assertTrue((owned / "FOREIGN-MARKER").is_file())
+        self.assertEqual(
+            (owned / "FOREIGN-MARKER").read_text(encoding="utf-8"),
+            foreign_marker_text,
+        )
+        # Owned inode was emptied via bound fd after the rename; marker path is gone
+        # but the renamed directory node itself must remain (not the foreign tree).
+        self.assertTrue(renamed.is_dir())
+        self.assertFalse((renamed / "OWNED-MARKER").exists())
+        shutil.rmtree(owned)
+        # Recreate claimed identity so cleanup can finish the run_dir.
+        record = (stand.manifest.get("owned_roots") or [])[-1]
+        rebound = renamed
+        # Put an empty directory back at the claimed path with matching identity:
+        # the emptied owned inode still lives at renamed; move it back.
+        rebound.rename(owned)
+        self.assertEqual(int(owned.stat().st_ino), int(record["st_ino"]))
+        result = stand.cleanup(revoke=False)
+        self.assertTrue(result["directory_removed"])
+        self.assertFalse(owned.exists())
+
+    def test_owned_root_directory_substitution_refuses_launch(self):
+        """P1/NFR-18: rename+mkdir replacement must not start Vikunja or write receipts."""
+        stand = IsolatedStand(profile=self.profile, worktree=self.worktree)
+        stand.prepare()
+        owned = stand.claim_owned_root(prefix="EA010-SYNTHETIC-owned-launch-")
+        record = (stand.manifest.get("owned_roots") or [])[-1]
+        claimed_ino = int(record["st_ino"])
+        # Minimal config so a buggy launch would have something to read.
+        config = json.loads((stand.run_dir / "config.json").read_text(encoding="utf-8"))
+        config["service"]["rootpath"] = str(owned)
+        config["database"]["path"] = str(owned / "stand.db")
+        config["files"]["basepath"] = str(owned / "files")
+        (owned / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        os.chmod(owned / "config.json", 0o600)
+        renamed = owned.parent / f"{owned.name}-renamed"
+        owned.rename(renamed)
+        owned.mkdir(mode=0o700)
+        # Foreign replacement carries its own config (would be enough for a path-only launch).
+        foreign_config = dict(config)
+        foreign_config["service"]["rootpath"] = str(owned)
+        foreign_config["database"]["path"] = str(owned / "stand.db")
+        foreign_config["files"]["basepath"] = str(owned / "files")
+        (owned / "config.json").write_text(json.dumps(foreign_config), encoding="utf-8")
+        os.chmod(owned / "config.json", 0o600)
+        before_names = sorted(p.name for p in owned.iterdir())
+        before_bytes = {
+            name: (owned / name).read_bytes()
+            for name in before_names
+            if (owned / name).is_file()
+        }
+        replacement_ino = int(owned.stat().st_ino)
+        self.assertNotEqual(claimed_ino, replacement_ino)
+        with self.assertRaises(StandError) as ctx:
+            stand.start_owned_vikunja(target=owned, role="synthetic-substituted")
+        self.assertIn("identity mismatch", str(ctx.exception).lower())
+        after_names = sorted(p.name for p in owned.iterdir())
+        self.assertEqual(after_names, before_names)
+        for name, payload in before_bytes.items():
+            self.assertEqual((owned / name).read_bytes(), payload)
+        self.assertFalse((owned / "stand.db").exists())
+        self.assertFalse((owned / "launch-receipt.json").exists())
+        self.assertFalse((owned / "Library").exists())
+        self.assertEqual(stand._owned_children, {})
+        # Repair: restore claimed inode so cleanup can finish.
+        shutil.rmtree(owned)
+        renamed.rename(owned)
+        result = stand.cleanup(revoke=False)
+        self.assertTrue(result["directory_removed"])
+        self.assertFalse(owned.exists())
+
     def test_pre_readiness_crash_window_keeps_service_from_listening(self):
         # Run start() in a child manager so SIGKILL does not kill the test process.
         with tempfile.TemporaryDirectory(prefix="ea010-crash-") as tmp:
@@ -778,6 +1012,79 @@ stand.start()
             # If identity/stop raced with watchdog SIGKILL, finish via orphan cleanup.
             cleanup_orphaned_runs(self.profile)
         self.assertEqual(listeners(self.profile.vikunja_port), set())
+
+    def test_owned_children_rss_survives_concurrent_stop(self):
+        """F1: concurrent stop during RSS must not kill the watchdog unnoticed."""
+        stand = IsolatedStand(profile=self.profile, worktree=self.worktree)
+        sleeper = subprocess.Popen(
+            [sys.executable, "-I", "-c", "import time; time.sleep(120)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        pause = threading.Event()
+        resume = threading.Event()
+        original_rss = process_tree_rss_bytes
+
+        def pausing_rss(root_pid: int) -> int:
+            if root_pid == sleeper.pid:
+                pause.set()
+                self.assertTrue(resume.wait(5), "stop side never resumed RSS probe")
+            return original_rss(root_pid)
+
+        try:
+            with stand._owned_lock:
+                stand._owned_children["probe-sleeper"] = sleeper
+            watchdog = LimitWatchdog(stand, interval=0.05)
+            stand._watchdog = watchdog
+            with mock.patch(
+                "tests.support.stand.process_tree_rss_bytes",
+                side_effect=pausing_rss,
+            ):
+                watchdog.start()
+                self.assertTrue(pause.wait(5), "watchdog never reached sleeper RSS")
+                stand.stop_owned_vikunja("probe-sleeper")
+                resume.set()
+                # Allow at least one more watchdog tick after the race window.
+                time.sleep(0.3)
+            self.assertTrue(watchdog._thread.is_alive())
+            watchdog.raise_if_failed()
+            with stand._owned_lock:
+                self.assertEqual(stand._owned_children, {})
+        finally:
+            resume.set()
+            if stand._watchdog is not None:
+                stand._watchdog.stop()
+                stand._watchdog = None
+            if sleeper.poll() is None:
+                os.kill(sleeper.pid, signal.SIGKILL)
+                sleeper.wait(timeout=5)
+
+    def test_watchdog_unexpected_error_fails_closed(self):
+        """F1: non-StandError monitor faults must surface via raise_if_failed."""
+        stand = IsolatedStand(profile=self.profile, worktree=self.worktree)
+        watchdog = LimitWatchdog(stand, interval=0.05)
+        stand._watchdog = watchdog
+        with mock.patch.object(
+            stand,
+            "_enforce_limits",
+            side_effect=RuntimeError("probe unexpected watchdog fault"),
+        ):
+            watchdog.start()
+            deadline = time.monotonic() + 3
+            signaled = False
+            while time.monotonic() < deadline:
+                try:
+                    watchdog.raise_if_failed()
+                except StandError as exc:
+                    self.assertIn("probe unexpected watchdog fault", str(exc))
+                    signaled = True
+                    break
+                time.sleep(0.05)
+            self.assertTrue(signaled)
+            self.assertFalse(watchdog._thread.is_alive())
+        watchdog.stop()
+        stand._watchdog = None
 
     def test_missing_binary_fails_not_skip(self):
         with tempfile.TemporaryDirectory(prefix="ea010-profile-") as tmp:
@@ -1007,6 +1314,7 @@ while True:
                 "lifecycle",
                 "mcp",
                 "recovery",
+                "restore",
                 "stand",
             ],
         )

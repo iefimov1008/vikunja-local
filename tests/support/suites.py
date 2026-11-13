@@ -54,6 +54,12 @@ def _lifecycle_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[str,
     return run_lifecycle_suite(mode=mode, worktree=worktree, argv=argv)
 
 
+def _restore_suite(*, mode: str, worktree: Path, argv: list[str]) -> dict[str, Any]:
+    from .restore_suite import run_restore_suite
+
+    return run_restore_suite(mode=mode, worktree=worktree, argv=argv)
+
+
 def register_suite(name: str, runner: SuiteRunner) -> None:
     if not name or not str(name).strip():
         raise StandError("Suite name must be non-empty")
@@ -105,3 +111,4 @@ register_suite("mcp", _mcp_suite)
 register_suite("hermes-bridge", _hermes_bridge_suite)
 register_suite("hermes-ux", _hermes_ux_suite)
 register_suite("lifecycle", _lifecycle_suite)
+register_suite("restore", _restore_suite)

@@ -11,15 +11,17 @@ import secrets
 import shutil
 import signal
 import socket
+import stat as stat_mod
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
@@ -103,6 +105,8 @@ def ownership_claim_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "status": manifest.get("status"),
         "process": manifest.get("process"),
         "launch_receipt": manifest.get("launch_receipt"),
+        "owned_roots": list(manifest.get("owned_roots") or []),
+        "owned_children": list(manifest.get("owned_children") or []),
         "ports": manifest.get("ports"),
         "listen_host": manifest.get("listen_host"),
         "cleanup_failure": manifest.get("cleanup_failure"),
@@ -110,6 +114,308 @@ def ownership_claim_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "binary": manifest.get("binary"),
         "created_at": manifest.get("created_at"),
     }
+
+
+def assert_owned_root_under_run_root(run_root: Path, owned: Path) -> Path:
+    """Require an owned restore/copy root to stay inside the approved run_root.
+
+    Cleanup must bind to the registered directory identity (NFR-18). Leaf or
+    ancestor symlink substitution is refused even when ``Path.resolve()`` would
+    still land on a sibling under ``run_root`` — otherwise recursive delete can
+    erase a foreign tree while leaving the renamed original owned directory.
+    """
+    root = run_root.resolve()
+    claimed = Path(owned)
+    if not claimed.is_absolute():
+        raise StandError(f"owned root must be absolute, got {owned}")
+    # abspath collapses '.'/'..' without following symlinks (unlike resolve()).
+    claimed_abs = Path(os.path.abspath(str(claimed)))
+    if claimed_abs == root:
+        raise StandError("owned root must not be the approved run_root itself")
+    try:
+        claimed_abs.relative_to(root)
+    except ValueError as exc:
+        raise StandError(
+            f"owned root escaped approved run_root: {claimed_abs} not under {root}"
+        ) from exc
+    # Refuse symlink substitution of the registered name or any ancestor under
+    # run_root before trusting resolve() for normalization.
+    probe = claimed_abs
+    while True:
+        if probe.is_symlink():
+            raise StandError(
+                f"owned root identity changed (symlink substitution): {claimed_abs}"
+            )
+        if probe == root:
+            break
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+    resolved = claimed_abs.resolve()
+    if resolved == root:
+        raise StandError("owned root must not be the approved run_root itself")
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise StandError(
+            f"owned root escaped approved run_root: {resolved} not under {root}"
+        ) from exc
+    # After refusing symlinks, resolve() only normalizes; identity stays claimed.
+    if resolved != claimed_abs:
+        raise StandError(
+            f"owned root identity changed (resolved away from claim): "
+            f"{claimed_abs} -> {resolved}"
+        )
+    return claimed_abs
+
+
+def owned_root_path(raw: Any) -> Path:
+    """Extract the registered path from a durable owned-root record or legacy string."""
+    if isinstance(raw, Mapping):
+        path_value = raw.get("path")
+        if not path_value:
+            raise StandError("owned root record missing path")
+        return Path(str(path_value))
+    return Path(raw)
+
+
+def capture_owned_root_identity(run_root: Path, owned: Path) -> dict[str, Any]:
+    """Persist path + durable directory/parent identity for later delete binding."""
+    bound = assert_owned_root_under_run_root(run_root, owned)
+    parent = bound.parent
+    try:
+        parent_fd = os.open(str(parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise StandError(
+            f"owned root parent identity unavailable: {parent}: {exc}"
+        ) from exc
+    try:
+        parent_st = os.fstat(parent_fd)
+        try:
+            dir_fd = os.open(
+                bound.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise StandError(
+                f"owned root identity unavailable: {bound}: {exc}"
+            ) from exc
+        try:
+            st = os.fstat(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(parent_fd)
+    return {
+        "path": str(bound),
+        "st_dev": int(st.st_dev),
+        "st_ino": int(st.st_ino),
+        "parent_st_dev": int(parent_st.st_dev),
+        "parent_st_ino": int(parent_st.st_ino),
+    }
+
+
+def assert_owned_root_record_identity(run_root: Path, raw: Any) -> Path:
+    """Require a durable owned-root record still names the claimed directory inode.
+
+    Path-string membership alone is insufficient: after claim -> rename aside ->
+    mkdir replacement at the same path, writes/launch must refuse the foreign
+    directory (NFR-18). Validates parent + directory st_dev/st_ino via O_NOFOLLOW.
+    """
+    if not isinstance(raw, Mapping):
+        raise StandError(
+            "owned root missing durable identity; refuse path-only launch"
+        )
+    try:
+        expected_dev = int(raw["st_dev"])
+        expected_ino = int(raw["st_ino"])
+        expected_parent_dev = int(raw["parent_st_dev"])
+        expected_parent_ino = int(raw["parent_st_ino"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise StandError(
+            "owned root durable identity incomplete; refuse launch"
+        ) from exc
+    bound = assert_owned_root_under_run_root(run_root, owned_root_path(raw))
+    parent = bound.parent
+    try:
+        parent_fd = os.open(str(parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise StandError(
+            f"owned root parent identity changed: {parent}: {exc}"
+        ) from exc
+    try:
+        parent_st = os.fstat(parent_fd)
+        if (int(parent_st.st_dev), int(parent_st.st_ino)) != (
+            expected_parent_dev,
+            expected_parent_ino,
+        ):
+            raise StandError(
+                f"owned root parent identity mismatch: {parent}"
+            )
+        try:
+            dir_fd = os.open(
+                bound.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise StandError(
+                f"owned root identity changed: {bound}: {exc}"
+            ) from exc
+        try:
+            st = os.fstat(dir_fd)
+            if (int(st.st_dev), int(st.st_ino)) != (expected_dev, expected_ino):
+                raise StandError(
+                    f"owned root identity mismatch (directory substitution): {bound}"
+                )
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(parent_fd)
+    return bound
+
+
+def _rmtree_via_dir_fd(dir_fd: int) -> None:
+    """Delete directory contents through a bound descriptor (no path re-walk)."""
+    for name in os.listdir(dir_fd):
+        try:
+            st = os.lstat(name, dir_fd=dir_fd)
+        except OSError as exc:
+            raise StandError(f"owned root entry unreadable during delete: {name}: {exc}") from exc
+        if stat_mod.S_ISLNK(st.st_mode) or not stat_mod.S_ISDIR(st.st_mode):
+            try:
+                os.unlink(name, dir_fd=dir_fd)
+            except OSError as exc:
+                raise StandError(
+                    f"owned root unlink failed during delete: {name}: {exc}"
+                ) from exc
+            continue
+        child_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=dir_fd,
+        )
+        try:
+            _rmtree_via_dir_fd(child_fd)
+        finally:
+            os.close(child_fd)
+        try:
+            os.rmdir(name, dir_fd=dir_fd)
+        except OSError as exc:
+            raise StandError(
+                f"owned root rmdir failed during delete: {name}: {exc}"
+            ) from exc
+
+
+# Test-only: runs after identity bind, before descriptor delete (delete-time race).
+_test_owned_root_pre_delete_hook: Callable[[Path], None] | None = None
+
+
+def delete_owned_root_record(run_root: Path, raw: Any) -> Path:
+    """Delete one claimed owned root only when durable identity still matches.
+
+    Opens parent + directory with O_NOFOLLOW, verifies st_dev/st_ino (and parent
+    identity), then removes through the bound descriptors. Path-only regular
+    directory substitution and delete-time races therefore refuse foreign trees
+    (NFR-18).
+    """
+    if not isinstance(raw, Mapping):
+        raise StandError(
+            "owned root missing durable identity; refuse path-only deletion"
+        )
+    try:
+        expected_dev = int(raw["st_dev"])
+        expected_ino = int(raw["st_ino"])
+        expected_parent_dev = int(raw["parent_st_dev"])
+        expected_parent_ino = int(raw["parent_st_ino"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise StandError(
+            "owned root durable identity incomplete; refuse deletion"
+        ) from exc
+    bound = assert_owned_root_under_run_root(run_root, owned_root_path(raw))
+    parent = bound.parent
+    try:
+        parent_fd = os.open(str(parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise StandError(
+            f"owned root parent identity changed: {parent}: {exc}"
+        ) from exc
+    try:
+        parent_st = os.fstat(parent_fd)
+        if (int(parent_st.st_dev), int(parent_st.st_ino)) != (
+            expected_parent_dev,
+            expected_parent_ino,
+        ):
+            raise StandError(
+                f"owned root parent identity mismatch: {parent}"
+            )
+        try:
+            dir_fd = os.open(
+                bound.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return bound
+        except OSError as exc:
+            raise StandError(
+                f"owned root identity changed: {bound}: {exc}"
+            ) from exc
+        try:
+            st = os.fstat(dir_fd)
+            if (int(st.st_dev), int(st.st_ino)) != (expected_dev, expected_ino):
+                raise StandError(
+                    f"owned root identity mismatch (directory substitution): {bound}"
+                )
+            hook = _test_owned_root_pre_delete_hook
+            if hook is not None:
+                hook(bound)
+            # Re-check after the test/race window before mutating.
+            st_after = os.fstat(dir_fd)
+            if (int(st_after.st_dev), int(st_after.st_ino)) != (
+                expected_dev,
+                expected_ino,
+            ):
+                raise StandError(
+                    f"owned root identity mismatch after bind: {bound}"
+                )
+            _rmtree_via_dir_fd(dir_fd)
+        finally:
+            os.close(dir_fd)
+        # Remove the directory name via the bound parent descriptor.
+        try:
+            # Confirm the name still refers to the claimed inode before rmdir.
+            verify_fd = os.open(
+                bound.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            return bound
+        except OSError as exc:
+            raise StandError(
+                f"owned root identity changed before rmdir: {bound}: {exc}"
+            ) from exc
+        try:
+            verify_st = os.fstat(verify_fd)
+            if (int(verify_st.st_dev), int(verify_st.st_ino)) != (
+                expected_dev,
+                expected_ino,
+            ):
+                raise StandError(
+                    f"owned root identity mismatch before rmdir: {bound}"
+                )
+        finally:
+            os.close(verify_fd)
+        try:
+            os.rmdir(bound.name, dir_fd=parent_fd)
+        except OSError as exc:
+            raise StandError(f"owned root rmdir failed ({bound}): {exc}") from exc
+    finally:
+        os.close(parent_fd)
+    return bound
 
 
 class StandError(RuntimeError):
@@ -701,7 +1007,9 @@ class LimitWatchdog:
         while not self._stop.wait(self.interval):
             try:
                 self.stand._enforce_limits()
-            except StandError as exc:
+            except Exception as exc:
+                # StandError (budget breach) and unexpected monitor faults both
+                # must durably fail the run — a dead watchdog is not fail-closed.
                 self._error = exc
                 try:
                     self.stand.stop_process(sig=signal.SIGKILL, wait_timeout=3.0)
@@ -734,6 +1042,10 @@ class IsolatedStand:
     _handshake_read_fd: int | None = field(default=None, init=False, repr=False)
     _handshake_write_fd: int | None = field(default=None, init=False, repr=False)
     _created_run_dir: bool = field(default=False, init=False, repr=False)
+    _owned_children: dict[str, subprocess.Popen[Any]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _owned_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     manifest: dict[str, Any] = field(default_factory=dict, init=False)
     cleaned: bool = field(default=False, init=False)
     readiness: dict[str, Any] | None = field(default=None, init=False)
@@ -777,14 +1089,28 @@ class IsolatedStand:
             elapsed = self._now_monotonic() - self._started_at
             if elapsed > self.profile.limits["wall_seconds"]:
                 raise StandError(f"Wall-clock limit exceeded: {elapsed:.1f}s")
+        disk = 0
         if self.run_dir.exists():
-            disk = directory_disk_bytes(self.run_dir)
-            if disk > self.profile.limits["disk_bytes"]:
-                raise StandError(f"Disk limit exceeded: {disk} bytes")
+            disk += directory_disk_bytes(self.run_dir)
+        for root in self.manifest.get("owned_roots") or []:
+            path = owned_root_path(root)
+            if path.exists():
+                disk += directory_disk_bytes(path)
+        if disk > self.profile.limits["disk_bytes"]:
+            raise StandError(f"Disk limit exceeded: {disk} bytes")
+        rss = 0
         if self._child is not None and self._child.poll() is None:
-            rss = process_tree_rss_bytes(self._child.pid)
-            if rss > self.profile.limits["owned_process_tree_rss_bytes"]:
-                raise StandError(f"RSS limit exceeded: {rss} bytes")
+            rss += process_tree_rss_bytes(self._child.pid)
+        # Snapshot under the owned-children lock so concurrent stop/start cannot
+        # raise "dictionary changed size during iteration" and silently kill the
+        # watchdog (NFR-18 resource-budget monitor must stay fail-closed).
+        with self._owned_lock:
+            owned_snapshot = list(self._owned_children.values())
+        for child in owned_snapshot:
+            if child.poll() is None:
+                rss += process_tree_rss_bytes(child.pid)
+        if rss > self.profile.limits["owned_process_tree_rss_bytes"]:
+            raise StandError(f"RSS limit exceeded: {rss} bytes")
 
     def _save_ownership_claim(self, extra: dict[str, Any] | None = None) -> None:
         """Mirror recoverable ownership outside the run tree (survives partial rmtree)."""
@@ -931,6 +1257,8 @@ class IsolatedStand:
                 "listen_host": self.profile.listen_host,
                 "fixture_prefix": self.profile.fixture_prefix,
                 "process": None,
+                "owned_roots": [],
+                "owned_children": [],
                 "token_handles": [],
                 "synthetic_ids": {},
                 "source": source,
@@ -1130,6 +1458,359 @@ class IsolatedStand:
             raise
         self._watchdog = LimitWatchdog(self)
         self._watchdog.start()
+
+    def claim_owned_root(self, *, prefix: str) -> Path:
+        """Create and durably register a copy/restore root before use (NFR-18)."""
+        if self._live_lock is None or not self._live_lock.held:
+            raise StandError("Cannot claim owned root without exclusive live-run lock")
+        if not self.manifest:
+            raise StandError("Cannot claim owned root before prepare()")
+        path = Path(
+            tempfile.mkdtemp(prefix=prefix, dir=str(self.profile.run_root))
+        )
+        os.chmod(path, self.profile.run_directory_mode)
+        record = capture_owned_root_identity(self.profile.run_root, path)
+        roots = list(self.manifest.get("owned_roots") or [])
+        roots.append(record)
+        self.manifest["owned_roots"] = roots
+        self._save_manifest()
+        return Path(record["path"])
+
+    def start_owned_vikunja(
+        self,
+        *,
+        target: Path,
+        role: str,
+    ) -> subprocess.Popen[Any]:
+        """Crash-safe launch of a restored Vikunja child with durable identity.
+
+        Mirrors IsolatedStand.start handshake/receipt protocol so SIGKILL of the
+        supervisor can reclaim the child from the ownership claim without private
+        in-memory knowledge (implementation-plan §6 / NFR-18).
+        """
+        if self._live_lock is None or not self._live_lock.held:
+            raise StandError("Cannot start owned Vikunja without exclusive live-run lock")
+        if not role or not str(role).strip():
+            raise StandError("owned Vikunja role must be non-empty")
+        role_key = str(role).strip()
+        with self._owned_lock:
+            if role_key in self._owned_children:
+                raise StandError(f"owned Vikunja role already running: {role_key}")
+        bound_target = assert_owned_root_under_run_root(self.profile.run_root, target)
+        matched_record: Mapping[str, Any] | None = None
+        for item in self.manifest.get("owned_roots") or []:
+            item_path = assert_owned_root_under_run_root(
+                self.profile.run_root, owned_root_path(item)
+            )
+            if str(item_path) == str(bound_target):
+                if not isinstance(item, Mapping):
+                    raise StandError(
+                        "owned Vikunja target lacks durable identity record; "
+                        f"refuse launch: {bound_target}"
+                    )
+                matched_record = item
+                break
+        if matched_record is None:
+            raise StandError(
+                f"owned Vikunja target must be claim_owned_root-registered first: {bound_target}"
+            )
+        # NFR-18: path membership is not enough — require claimed directory inode
+        # before reading config, writing receipts, or releasing the child.
+        bound_target = assert_owned_root_record_identity(
+            self.profile.run_root, matched_record
+        )
+        config_path = bound_target / "config.json"
+        if not config_path.is_file():
+            raise StandError(f"restored config missing at {config_path}")
+        # Source contour must not still own the profile port.
+        if self._child is not None and self._child.poll() is None:
+            raise StandError("stop source Vikunja before starting an owned restore child")
+        busy = listeners(self.profile.vikunja_port)
+        if busy:
+            raise StandError(
+                f"Cannot start owned Vikunja; port {self.profile.vikunja_port} busy: {sorted(busy)}"
+            )
+
+        # Re-bind after config/port checks in case of rename+mkdir substitution.
+        bound_target = assert_owned_root_record_identity(
+            self.profile.run_root, matched_record
+        )
+        config_path = bound_target / "config.json"
+
+        read_fd, write_fd = os.pipe()
+        self._handshake_read_fd = read_fd
+        self._handshake_write_fd = write_fd
+        wrapper = (
+            "import os,resource,select,sys\n"
+            "os.umask(0o077)\n"
+            f"limit={int(self.profile.limits['disk_bytes'])}\n"
+            "resource.setrlimit(resource.RLIMIT_FSIZE,(limit,limit))\n"
+            "ready,_,_ = select.select([sys.stdin],[],[],15)\n"
+            "if not ready:\n"
+            "    sys.exit(75)\n"
+            "if os.read(0,1) != b'G':\n"
+            "    sys.exit(76)\n"
+            "os.execv(sys.argv[1], sys.argv[1:])\n"
+        )
+        popen = self._test_popen or subprocess.Popen
+        try:
+            child = popen(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    wrapper,
+                    str(self.profile.binary_path),
+                    "--config",
+                    str(config_path),
+                    "web",
+                ],
+                cwd=str(bound_target),
+                env={
+                    "HOME": str(bound_target),
+                    "PATH": "/usr/bin:/bin",
+                    "GOMEMLIMIT": "1GiB",
+                },
+                stdin=read_fd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except BaseException:
+            self._close_handshake()
+            raise
+        self._close_handshake_fd("_handshake_read_fd")
+        with self._owned_lock:
+            self._owned_children[role_key] = child
+        # Refuse path writes into a substituted directory before any receipt.
+        bound_target = assert_owned_root_record_identity(
+            self.profile.run_root, matched_record
+        )
+        receipt_path = bound_target / LAUNCH_RECEIPT_NAME
+        try:
+            receipt = {
+                "schema": "ea010-stand-launch-receipt/v1",
+                "run_id": self.run_id,
+                "role": role_key,
+                "root": str(bound_target),
+                "pid": child.pid,
+                "phase": "pre-identity",
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+            atomic_write_secure(
+                receipt_path,
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                self.profile.sensitive_file_mode,
+            )
+            # Keep run_dir launch-receipt in lockstep so orphan cleanup cannot
+            # reload a stale source receipt over the active owned child.
+            self._save_launch_receipt(receipt)
+            child_record = {
+                "role": role_key,
+                "root": str(bound_target),
+                "pid": child.pid,
+                "identity": None,
+                "launch_receipt": receipt,
+                "status": "launching",
+            }
+            children = [
+                item
+                for item in (self.manifest.get("owned_children") or [])
+                if item.get("role") != role_key
+            ]
+            children.append(child_record)
+            self.manifest["owned_children"] = children
+            # Also point primary process fields at the active owned child so
+            # cleanup_manifest / ownership-claim recovery can signal it when the
+            # source contour is already stopped.
+            self.manifest["process"] = {"pid": child.pid, "identity": None}
+            self.manifest["launch_receipt"] = receipt
+            self.manifest["status"] = f"owned_launching:{role_key}"
+            self._save_manifest()
+            if self._test_crash_after_popen is not None:
+                self._test_crash_after_popen(self, child)
+            identity = process_start_identity(child.pid)
+            identity_receipt = {
+                "schema": "ea010-stand-launch-receipt/v1",
+                "run_id": self.run_id,
+                "role": role_key,
+                "root": str(bound_target),
+                "pid": child.pid,
+                "phase": "identity-persisted",
+                "identity": identity,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+            child_record = {
+                "role": role_key,
+                "root": str(bound_target),
+                "pid": child.pid,
+                "identity": identity,
+                "launch_receipt": identity_receipt,
+                "status": "starting",
+            }
+            atomic_write_secure(
+                receipt_path,
+                json.dumps(identity_receipt, indent=2, sort_keys=True) + "\n",
+                self.profile.sensitive_file_mode,
+            )
+            self._save_launch_receipt(identity_receipt)
+            children = [
+                item
+                for item in (self.manifest.get("owned_children") or [])
+                if item.get("role") != role_key
+            ]
+            children.append(child_record)
+            self.manifest["owned_children"] = children
+            self.manifest["process"] = {
+                "pid": child.pid,
+                "identity": identity,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "role": role_key,
+                "root": str(bound_target),
+            }
+            self.manifest["launch_receipt"] = identity_receipt
+            self.manifest["status"] = f"owned_starting:{role_key}"
+            self._save_manifest()
+            # Final inode bind before releasing the child handshake.
+            bound_target = assert_owned_root_record_identity(
+                self.profile.run_root, matched_record
+            )
+            os.write(write_fd, b"G")
+            self._close_handshake()
+        except BaseException:
+            self._close_handshake()
+            try:
+                if child.poll() is None:
+                    os.kill(child.pid, signal.SIGKILL)
+                    child.wait(timeout=5)
+            except Exception:
+                pass
+            with self._owned_lock:
+                self._owned_children.pop(role_key, None)
+            raise
+
+        # Wait until this owned child alone owns the profile port and answers /info.
+        deadline = time.monotonic() + 25.0
+        last = "not ready"
+        while time.monotonic() < deadline:
+            if child.poll() is not None:
+                raise StandError(f"owned Vikunja exited rc={child.returncode}")
+            owned = listeners(self.profile.vikunja_port)
+            if owned and child.pid not in owned:
+                time.sleep(0.1)
+                continue
+            if child.pid not in owned:
+                time.sleep(0.1)
+                continue
+            try:
+                status, info = http_json(
+                    self.profile.listen_host, self.profile.vikunja_port, "info"
+                )
+                if status == 200 and isinstance(info, dict):
+                    identity = process_start_identity(child.pid)
+                    ready_receipt = {
+                        "schema": "ea010-stand-launch-receipt/v1",
+                        "run_id": self.run_id,
+                        "role": role_key,
+                        "root": str(bound_target),
+                        "pid": child.pid,
+                        "phase": "ready",
+                        "identity": identity,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    atomic_write_secure(
+                        receipt_path,
+                        json.dumps(ready_receipt, indent=2, sort_keys=True) + "\n",
+                        self.profile.sensitive_file_mode,
+                    )
+                    self._save_launch_receipt(ready_receipt)
+                    child_record = {
+                        "role": role_key,
+                        "root": str(bound_target),
+                        "pid": child.pid,
+                        "identity": identity,
+                        "launch_receipt": ready_receipt,
+                        "status": "ready",
+                    }
+                    children = [
+                        item
+                        for item in (self.manifest.get("owned_children") or [])
+                        if item.get("role") != role_key
+                    ]
+                    children.append(child_record)
+                    self.manifest["owned_children"] = children
+                    self.manifest["process"] = {
+                        "pid": child.pid,
+                        "identity": identity,
+                        "started_at": datetime.now(timezone.utc).isoformat(),
+                        "role": role_key,
+                        "root": str(bound_target),
+                    }
+                    self.manifest["launch_receipt"] = ready_receipt
+                    self.manifest["status"] = f"owned_ready:{role_key}"
+                    self._save_manifest()
+                    if self._watchdog is None:
+                        self._watchdog = LimitWatchdog(self)
+                        self._watchdog.start()
+                    return child
+                last = f"info HTTP {status}"
+            except Exception as exc:  # noqa: BLE001
+                last = str(exc)
+            time.sleep(0.1)
+        try:
+            os.kill(child.pid, signal.SIGKILL)
+            child.wait(timeout=5)
+        except Exception:
+            pass
+        with self._owned_lock:
+            self._owned_children.pop(role_key, None)
+        raise StandError(f"owned Vikunja not ready: {last}")
+
+    def stop_owned_vikunja(self, role: str | None = None) -> None:
+        """Stop one or all owned restore children and clear primary process binding."""
+        with self._owned_lock:
+            roles = [role] if role is not None else list(self._owned_children)
+        for role_key in roles:
+            with self._owned_lock:
+                child = self._owned_children.pop(role_key, None)
+            if child is None:
+                continue
+            records = [
+                item
+                for item in (self.manifest.get("owned_children") or [])
+                if item.get("role") == role_key
+            ]
+            identity = (records[0].get("identity") if records else None) or (
+                (self.manifest.get("process") or {}).get("identity")
+            )
+            if child.poll() is None:
+                if identity and not process_matches_identity(identity):
+                    raise StandError(
+                        f"Refusing to signal owned child {role_key}: PID identity mismatch"
+                    )
+                try:
+                    os.kill(child.pid, signal.SIGTERM)
+                    child.wait(timeout=5)
+                except Exception:
+                    try:
+                        if identity is None or process_matches_identity(identity):
+                            os.kill(child.pid, signal.SIGKILL)
+                            child.wait(timeout=5)
+                    except Exception:
+                        pass
+            remaining = [
+                item
+                for item in (self.manifest.get("owned_children") or [])
+                if item.get("role") != role_key
+            ]
+            self.manifest["owned_children"] = remaining
+            process = self.manifest.get("process") or {}
+            if process.get("role") == role_key or process.get("pid") == child.pid:
+                self.manifest["process"] = None
+                self.manifest["launch_receipt"] = None
+            if self.manifest_path.exists():
+                self._save_manifest()
 
     def _refresh_process_identity(self) -> None:
         if self._child is None or self._child.poll() is not None:
@@ -1351,11 +2032,21 @@ class IsolatedStand:
         return evidence
 
     def stop_process(self, sig: int = signal.SIGTERM, wait_timeout: float = 8.0) -> None:
+        # Always stop owned restore children first so profile ports/roots clear.
+        try:
+            self.stop_owned_vikunja()
+        except StandError:
+            # Fall through to primary stop + cleanup failure accounting.
+            pass
         child = self._child
         if child is None:
             return
         if child.poll() is None:
             identity = (self.manifest.get("process") or {}).get("identity")
+            # When process is bound to an owned restore child, stop_owned_vikunja
+            # already handled it; avoid double-signalling a cleared handle.
+            if (self.manifest.get("process") or {}).get("role"):
+                return
             if identity and not process_matches_identity(identity):
                 raise StandError("Refusing to signal process: PID identity mismatch")
             os.kill(child.pid, sig)
@@ -1469,7 +2160,7 @@ class IsolatedStand:
                 f"{({'run_id': self.run_id, 'errors': errors, 'listeners_after': listeners_after, 'still_matches': still_matches})}"
             )
 
-        # Bound deletion to the validated immediate run_id child only.
+        # Bound deletion to validated owned roots + the immediate run_id child.
         try:
             bound = bind_manifest_paths(self.profile, self.manifest, manifest_path=self.manifest_path)
         except StandError as exc:
@@ -1477,56 +2168,93 @@ class IsolatedStand:
             self._record_cleanup_failure(errors)
             self.cleaned = False
             raise StandError(f"Cleanup failed; recovery state retained: {errors}") from exc
-        if bound.exists():
-            # Checkpoint ownership outside the tree before recursive delete.
+        owned_records = list(self.manifest.get("owned_roots") or [])
+        owned_paths: list[Path] = []
+        for raw in owned_records:
             try:
-                self._save_ownership_claim()
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"failed to checkpoint ownership before rmtree: {exc}")
-                self._record_cleanup_failure(
-                    errors,
-                    {
-                        "stop_error": stop_error,
-                        "still_matches_identity": still_matches,
-                        "listeners_after": listeners_after,
-                        "directory_retained": True,
-                    },
+                owned_paths.append(
+                    assert_owned_root_under_run_root(
+                        self.profile.run_root, owned_root_path(raw)
+                    )
                 )
-                self.cleaned = False
-                raise StandError(
-                    f"Cleanup failed; recovery state retained: "
-                    f"{({'run_id': self.run_id, 'errors': errors, 'listeners_after': listeners_after})}"
-                ) from exc
+            except StandError as exc:
+                errors.append(str(exc))
+        if errors:
+            self._record_cleanup_failure(
+                errors,
+                {
+                    "stop_error": stop_error,
+                    "still_matches_identity": still_matches,
+                    "listeners_after": listeners_after,
+                    "directory_retained": self.run_dir.exists(),
+                },
+            )
+            self.cleaned = False
+            raise StandError(
+                f"Cleanup failed; recovery state retained: "
+                f"{({'run_id': self.run_id, 'errors': errors, 'listeners_after': listeners_after})}"
+            )
+        # Checkpoint ownership outside the tree before recursive delete.
+        try:
+            self._save_ownership_claim()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"failed to checkpoint ownership before rmtree: {exc}")
+            self._record_cleanup_failure(
+                errors,
+                {
+                    "stop_error": stop_error,
+                    "still_matches_identity": still_matches,
+                    "listeners_after": listeners_after,
+                    "directory_retained": True,
+                },
+            )
+            self.cleaned = False
+            raise StandError(
+                f"Cleanup failed; recovery state retained: "
+                f"{({'run_id': self.run_id, 'errors': errors, 'listeners_after': listeners_after})}"
+            ) from exc
+        for raw, owned in zip(owned_records, owned_paths):
+            try:
+                delete_owned_root_record(self.profile.run_root, raw)
+            except StandError as exc:
+                errors.append(str(exc))
+        leftovers = [
+            str(path)
+            for path in owned_paths
+            if path.exists() or path.is_symlink()
+        ]
+        # Only destroy the run_dir after every owned root identity-bound delete
+        # succeeded; otherwise retain the in-tree recovery record (NFR-18).
+        if not errors and not leftovers and bound.exists():
             try:
                 shutil.rmtree(bound)
             except OSError as exc:
                 errors.append(f"rmtree failed: {exc}")
-                self._record_cleanup_failure(
-                    errors,
-                    {
-                        "stop_error": stop_error,
-                        "still_matches_identity": still_matches,
-                        "listeners_after": listeners_after,
-                        "directory_retained": self.run_dir.exists(),
-                    },
-                )
-                self.cleaned = False
-                raise StandError(
-                    f"Cleanup failed; recovery state retained: "
-                    f"{({'run_id': self.run_id, 'errors': errors, 'listeners_after': listeners_after})}"
-                ) from exc
         still_there = self.run_dir.exists()
+        if errors or leftovers or still_there:
+            self._record_cleanup_failure(
+                errors + ([f"owned roots retained: {leftovers}"] if leftovers else []),
+                {
+                    "stop_error": stop_error,
+                    "still_matches_identity": still_matches,
+                    "listeners_after": listeners_after,
+                    "directory_retained": still_there,
+                    "owned_roots_retained": leftovers,
+                },
+            )
+            self.cleaned = False
+            raise StandError(
+                f"Cleanup failed; recovery state retained: "
+                f"{({'run_id': self.run_id, 'errors': errors, 'listeners_after': listeners_after, 'owned_roots_retained': leftovers})}"
+            )
         result = {
             "run_id": self.run_id,
             "directory_removed": not still_there,
+            "owned_roots_removed": True,
             "listeners_after": listeners_after,
             "revoke_readback": revoke_evidence,
             "errors": errors,
         }
-        if still_there:
-            self._record_cleanup_failure(errors + ["directory still present after rmtree"])
-            self.cleaned = False
-            raise StandError(f"Cleanup failed: {result}")
         try:
             self._clear_ownership_claim()
         except StandError as exc:
@@ -1536,6 +2264,8 @@ class IsolatedStand:
             ) from exc
         self.cleaned = True
         self._child = None
+        with self._owned_lock:
+            self._owned_children.clear()
         self._release_live_lock()
         return result
 
@@ -1820,6 +2550,45 @@ def _stop_manifest_process(manifest: dict[str, Any]) -> tuple[bool, list[str]]:
     return stopped, errors
 
 
+def _stop_owned_children_from_manifest(manifest: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Stop every durable owned restore child recorded on the manifest/claim."""
+    errors: list[str] = []
+    all_stopped = True
+    for record in list(manifest.get("owned_children") or []):
+        if not isinstance(record, dict):
+            errors.append("owned_children entry is not an object")
+            all_stopped = False
+            continue
+        synthetic = {
+            "run_id": manifest.get("run_id"),
+            "process": {
+                "pid": record.get("pid"),
+                "identity": record.get("identity"),
+            },
+            "launch_receipt": record.get("launch_receipt") or {
+                "run_id": manifest.get("run_id"),
+                "pid": record.get("pid"),
+                "identity": record.get("identity"),
+            },
+        }
+        # Prefer target-local launch receipt when present.
+        root = record.get("root")
+        if root:
+            receipt_path = Path(root) / LAUNCH_RECEIPT_NAME
+            if receipt_path.is_file():
+                try:
+                    synthetic["launch_receipt"] = json.loads(
+                        receipt_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    pass
+        stopped, child_errors = _stop_manifest_process(synthetic)
+        errors.extend(child_errors)
+        if not stopped:
+            all_stopped = False
+    return all_stopped, errors
+
+
 def cleanup_manifest(profile: StandProfile, manifest: dict[str, Any], *, manifest_path: Path | None = None) -> dict[str, Any]:
     bound_dir = bind_manifest_paths(profile, manifest, manifest_path=manifest_path)
     run_id = validate_run_id(str(manifest.get("run_id") or ""))
@@ -1837,16 +2606,49 @@ def cleanup_manifest(profile: StandProfile, manifest: dict[str, Any], *, manifes
     except StandError:
         # Still attempt stop/delete; failure persistence below will re-raise claim errors.
         pass
-    stopped, errors = _stop_manifest_process(manifest)
+    owned_stopped, owned_errors = _stop_owned_children_from_manifest(manifest)
+    errors: list[str] = list(owned_errors)
+    process = manifest.get("process") or {}
+    process_role = process.get("role")
+    owned_roles = {
+        item.get("role")
+        for item in (manifest.get("owned_children") or [])
+        if isinstance(item, dict)
+    }
+    if process_role and process_role in owned_roles:
+        # Primary process binding already covered by owned_children stop.
+        stopped = owned_stopped
+    else:
+        primary_stopped, primary_errors = _stop_manifest_process(manifest)
+        errors.extend(primary_errors)
+        stopped = bool(primary_stopped and owned_stopped)
     listeners_after = {str(port): sorted(listeners(port)) for port in profile.all_ports}
     busy = {port: pids for port, pids in listeners_after.items() if pids}
-    try:
-        identity = _durable_process_identity(manifest)
-    except StandError as exc:
-        identity = None
-        if str(exc) not in errors:
+    still_matches = False
+    if not (process_role and process_role in owned_roles):
+        try:
+            identity = _durable_process_identity(manifest)
+        except StandError as exc:
+            identity = None
+            if str(exc) not in errors:
+                errors.append(str(exc))
+        still_matches = bool(identity and process_matches_identity(identity))
+    for record in manifest.get("owned_children") or []:
+        if not isinstance(record, dict):
+            continue
+        child_identity = record.get("identity")
+        if isinstance(child_identity, dict) and process_matches_identity(child_identity):
+            still_matches = True
+            break
+    owned_records = list(manifest.get("owned_roots") or [])
+    owned_roots: list[Path] = []
+    for raw in owned_records:
+        try:
+            owned_roots.append(
+                assert_owned_root_under_run_root(profile.run_root, owned_root_path(raw))
+            )
+        except StandError as exc:
             errors.append(str(exc))
-    still_matches = bool(identity and process_matches_identity(identity))
     if errors or not stopped or busy or still_matches:
         # Retain recovery state; do not destroy the only retry information.
         failure_payload = {
@@ -1856,6 +2658,7 @@ def cleanup_manifest(profile: StandProfile, manifest: dict[str, Any], *, manifes
             "still_matches_identity": still_matches,
             "listeners_after": listeners_after,
             "directory_retained": True,
+            "owned_roots": list(owned_records),
         }
         failure = {
             "schema": MANIFEST_SCHEMA,
@@ -1880,45 +2683,55 @@ def cleanup_manifest(profile: StandProfile, manifest: dict[str, Any], *, manifes
             f"Orphan cleanup failed; recovery state retained: "
             f"{({'run_id': manifest.get('run_id'), 'errors': errors, 'listeners_after': listeners_after, 'stopped': stopped})}"
         )
-    if bound_dir.exists():
+    for raw in owned_records:
+        try:
+            delete_owned_root_record(profile.run_root, raw)
+        except StandError as exc:
+            errors.append(str(exc))
+    leftovers = [
+        str(path) for path in owned_roots if path.exists() or path.is_symlink()
+    ]
+    if not errors and not leftovers and bound_dir.exists():
         try:
             shutil.rmtree(bound_dir)
         except OSError as exc:
-            failure_payload = {
-                "at": datetime.now(timezone.utc).isoformat(),
-                "errors": [f"rmtree failed: {exc}"],
-                "process_stopped": stopped,
-                "listeners_after": listeners_after,
-                "directory_retained": bound_dir.exists(),
-            }
-            failure = {
-                "schema": MANIFEST_SCHEMA,
-                **manifest,
-                "status": "cleanup_failed",
-                "cleanup_failure": failure_payload,
-            }
-            write_ownership_claim(profile, ownership_claim_from_manifest(failure))
-            if bound_dir.exists():
-                try:
-                    atomic_write_secure(
-                        bound_dir / "resource-manifest.json",
-                        json.dumps(failure, indent=2, sort_keys=True) + "\n",
-                        profile.sensitive_file_mode,
-                    )
-                except OSError:
-                    pass
-            raise StandError(
-                f"Orphan cleanup failed; recovery state retained: "
-                f"{({'run_id': run_id, 'errors': failure_payload['errors'], 'listeners_after': listeners_after})}"
-            ) from exc
+            errors.append(f"rmtree failed: {exc}")
+    if errors or leftovers or bound_dir.exists():
+        failure_payload = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "errors": errors + ([f"owned roots retained: {leftovers}"] if leftovers else []),
+            "process_stopped": stopped,
+            "listeners_after": listeners_after,
+            "directory_retained": bound_dir.exists(),
+            "owned_roots_retained": leftovers,
+        }
+        failure = {
+            "schema": MANIFEST_SCHEMA,
+            **manifest,
+            "status": "cleanup_failed",
+            "cleanup_failure": failure_payload,
+        }
+        write_ownership_claim(profile, ownership_claim_from_manifest(failure))
+        if bound_dir.exists():
+            try:
+                atomic_write_secure(
+                    bound_dir / "resource-manifest.json",
+                    json.dumps(failure, indent=2, sort_keys=True) + "\n",
+                    profile.sensitive_file_mode,
+                )
+            except OSError:
+                pass
+        raise StandError(
+            f"Orphan cleanup failed; recovery state retained: "
+            f"{({'run_id': run_id, 'errors': failure_payload['errors'], 'listeners_after': listeners_after, 'owned_roots_retained': leftovers})}"
+        )
     result = {
         "run_id": manifest.get("run_id"),
         "process_stopped": stopped,
         "directory_removed": not bound_dir.exists(),
+        "owned_roots_removed": True,
         "listeners_after": listeners_after,
     }
-    if not result["directory_removed"]:
-        raise StandError(f"Orphan cleanup failed: {result}")
     clear_ownership_claim(profile, run_id)
     return result
 
@@ -2001,6 +2814,8 @@ def cleanup_orphaned_runs(
                         "status": claim.get("status") or "cleanup_failed",
                         "process": claim.get("process"),
                         "launch_receipt": claim.get("launch_receipt"),
+                        "owned_roots": list(claim.get("owned_roots") or []),
+                        "owned_children": list(claim.get("owned_children") or []),
                         "ports": claim.get("ports") or dict(profile.ports),
                         "listen_host": claim.get("listen_host") or profile.listen_host,
                         "cleanup_failure": claim.get("cleanup_failure"),
